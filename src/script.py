@@ -255,14 +255,15 @@ if __name__ == "__main__":
     print(f"names: {table.juanjo}")
 
 
-    bol_vec = (table.id == 1) | (table.name == "Alice")
-    print(f"names: {bol_vec}")
+    bol_vec = ((table["id"] == 0) & (table["name"] == "Alice"))
 
     print(f"fila 2: {table.get_row(2)}")
 
     print(f"len(tabla): {len(table)}")
 
-    print(f"Filtro: \n{table.filter(bol_vec)}")
+    print(bol_vec)
+
+    #print(f"Filtro: \n{table.filter(bol_vec)}")
 
 
 
