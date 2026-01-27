@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import Field
+from os import wait
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 import numpy as np
@@ -343,26 +344,40 @@ class ColumnTable_B2(Generic[RowT]):
         for r in rows:
             self.append(r)
 
+    def row(self, index: int) -> RowT | None:
+        num_rows = self._n_rows
+        if not (0 <= index < num_rows):
+            return None
+
+        data = {
+            name: self._cols[name][index]
+            for name in self._cols.keys()
+        }
+
+        return self._row_type(**data)
+
 
 
     def filter(self, expr_result) -> ColumnTable_B2:
-        """Filtra usando el resultado de una expresión Blosc2"""
-        # Materializamos la máscara a numpy bool para iterar índices
-        # (Esto es rápido porque es solo 1 bit por fila)
-        if hasattr(expr_result, "to_numpy"):
-            mask = expr_result.to_numpy()
+        filtro = None
+        if isinstance(expr_result, blosc2.LazyExpr):
+            filtro = expr_result.compute()
+        elif isinstance(expr_result, blosc2.NDArray):
+            filtro = expr_result
         else:
-            mask = np.array(expr_result, dtype=bool)
+            raise TypeError(f"El tipo {type(expr_result)} no es válido. Se esperaba blosc2.LazyExpr.")
 
-        indices = np.where(mask)[0]
-
-        retval = ColumnTable_B2(self._row_type)
-        # Copiamos fila a fila (se podría optimizar copiando chunks enteros)
-        for i in indices:
-            retval.append(self.get_row(int(i)))  # int(i) para evitar tipos numpy
+        retval = ColumnTable_B2(self._row_type, self._capacity)
+        if filtro is not None and len(filtro) >= self._n_rows:
+            for i in range(self._n_rows):
+                if filtro[i]:
+                    retval.append(self.row(i))
         return retval
 
-    def get_row(self, index: int) -> RowT | None:
+
+
+
+    def row(self, index: int) -> RowT | None:
         if not (0 <= index < self.nrows):
             return None
 
@@ -459,6 +474,7 @@ class ColumnTable_B2(Generic[RowT]):
 
 
 if __name__ == "__main__":
+    '''
     table = ColumnTable(RowModel)
     table.append({"id": 0, "name": "Alice", "score": 91.5})
     table.extend(
@@ -468,30 +484,30 @@ if __name__ == "__main__":
             {"id": 2, "name": "carol", "score": 73.25},
         ]
     )
-
     print("Rows:", table.nrows)
+    ###########################################################################
+    ###########################################################################
+    ###########################################################################
 
 
+    
+    print("\n############ Segunda prueba #############\n")
 
-
-    print("Segunda prueba")
-    #print(table)
-
-    print(f"names: {table["name"]}")
-    print(f"names: {table.juanjo}")
-    print(f"Tabla:\n{table}")
+    print(f"names con getitem: {table["name"]}")
+    print(f"names con getattr: {table.name}")
+    print(f"Tabla: \n{table}")
 
 
     bol_vec = (table.id == 1) | (table.name == "Alice")
     print(f"names: {bol_vec}")
-
     print(f"fila 2: {table.row(2)}")
-
     print(f"len(tabla): {len(table)}")
-
     print(f"Filtro: \n{table.filter(bol_vec)}")
-
+    '''
+    #Creamos nuestra tabla de prueba
     tableb2 = ColumnTable_B2(RowModel)
+
+    #Probamos a introducir datos de diferentes forman
     tableb2.append({"id": 0, "name": "Alice", "score": 91.5})
 
     tableb2.extend(
@@ -504,21 +520,27 @@ if __name__ == "__main__":
         ]
     )
 
+    #preparamos una comparación
+    exp = ((tableb2["id"] == 1))
+    type(exp)
+    verdad = exp.compute()
 
     print(f"Tabla:\n{tableb2}")
+    print(f"names: {verdad[:tableb2.nrows]}")
+    print("\n\n")
 
-    print(f"names: {(tableb2["id"] == 1)}")
 
     tableb2.save(urlpath="people.b2z")
 
     # Load back
     loaded = ColumnTable_B2.load(urlpath="people.b2z")
-    print(loaded)
-    print("Loaded rows:", loaded.nrows)
-    print("Loaded name column:", loaded["name"])
-    print("Loaded score column:", loaded["score"])
-    print("Loaded score column:", loaded["active"])
+    print("\n\n", loaded)
 
+    print(type([True, False, True, False]))
+    tableb2.filter(exp)
+    tableb2.filter(verdad)
+    #tableb2.filter([True, False, True, False]) #ejemplo de excepción
 
+    #print(tableb2.filter(verdad))
 
 
