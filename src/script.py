@@ -235,22 +235,26 @@ class ColumnTable(Generic[RowT]):
 
 class ColumnTable_B2(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT]):
+    def __init__(self, row_type: type[RowT], capacity: int = 512):
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
-        shape = (512,512)
+        self._capacity: int = capacity
+        self._n_rows: int = 0
+        self._col_widths: dict[str, int] = {}
+
 
         for name, field in row_type.model_fields.items():
             origin = getattr(field.annotation, "__origin__", field.annotation)
 
             if origin == str or field.annotation == str:
-                max_len = 32
+                max_len = 32  # Default si no hay MaxLen
                 if hasattr(field.annotation, "__metadata__"):
                     for meta in field.annotation.__metadata__:
                         if isinstance(meta, MaxLen):
                             max_len = meta.max_length
                             break
                 dt = np.dtype(f"U{max_len}")
+                display_width = max(10, min(max_len, 50))
 
             elif origin == bytes or field.annotation == bytes:
                 max_len = 32
@@ -260,35 +264,86 @@ class ColumnTable_B2(Generic[RowT]):
                             max_len = meta.max_length
                             break
                 dt = np.dtype(f"S{max_len}")
+                display_width = max(10, min(max_len, 50))
 
             elif origin == int or field.annotation == int:
                 dt = np.int64
+                display_width = 12  # Suficiente para enteros estándar
 
             elif origin == float or field.annotation == float:
                 dt = np.float64
+                display_width = 15  # Espacio para decimales y notación científica
 
             elif origin == bool or field.annotation == bool:
                 dt = np.bool_
+                display_width = 6  # "True" / "False" caben en 5-6
 
             elif origin == complex or field.annotation == complex:
                 dt = np.complex128
+                display_width = 25  # (1.23+4.56j) suele ser largo
 
             else:
                 dt = np.object_
+                display_width = 20
 
-            self._cols[name] = blosc2.zeros(shape=shape, dtype=dt)
+            final_width = max(len(name), display_width)
+            self._col_widths[name] = final_width
 
-    def append(self, data: dict[str, Any] | RowT) -> None:
-        ...
+            self._cols[name] = blosc2.zeros(shape=capacity, dtype=dt)
 
-    def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
-       ...
+    def __str__(self):
+        # Versión simplificada del print
+        retval = []
+        # arrays = self.to_numpy()
+        cont = 0
+        for name in self._cols.keys():
+            retval.append(f"{name:^{self._col_widths[name]}} |")
+            cont += self._col_widths[name]+2
+        retval.append("\n")
+        for i in range(cont):
+            retval.append("-")
+        retval.append("\n")
+
+        for i in range(self._n_rows):
+            for name in self._cols.keys():
+                retval.append(f"{self._cols[name][i]:^{self._col_widths[name]}}")
+                retval.append(f" |")
+            retval.append("\n")
+            for i in range(cont):
+                retval.append("-")
+            retval.append("\n")
+        return "".join(retval)
 
     def __getitem__(self, s: str):
-        ...
+        return self._cols[s] if s in self._cols else None
 
     def __getattr__(self, s: str):
         return self[s] if s in self._cols else super().__getattribute__(s)
+
+    @property
+    def nrows(self) -> int:
+        return self._n_rows
+
+    def append(self, data: dict[str, Any] | RowT) -> None:
+        #Falta comprobar que el tipo de datos de RowT coincide con el del diccionario
+
+        if self._n_rows >= self._capacity:
+            self._capacity *= 2
+            for col_array in self._cols.values():
+                col_array.resize((self._capacity,))
+
+        row = data if isinstance(data, self._row_type) else self._row_type(**data)
+
+        for k, v in row.model_dump().items():
+            self._cols[k][self._n_rows] = v
+
+        self._n_rows += 1
+
+    def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
+        for r in rows:
+            self.append(r)
+
+
 
     def filter(self, expr_result) -> ColumnTable_B2:
         """Filtra usando el resultado de una expresión Blosc2"""
@@ -313,89 +368,94 @@ class ColumnTable_B2(Generic[RowT]):
 
         data = {}
         for name, schunk in self._cols.items():
-            # Descomprimir SOLO ese dato
-            # schunk[index] devuelve un array 0-D, sacamos el escalar con .item()
             arr_val = schunk[index]  # Esto descomprime el chunk afectado
             data[name] = arr_val[0] if isinstance(arr_val, (np.ndarray, blosc2.NDArray)) else arr_val
 
         return self._row_type(**data)
 
-    @property
-    def nrows(self) -> int:
-        if not self._cols: return 0
-        return next(iter(self._cols.values())).nitems
 
     def save(self, urlpath: str, group: str = "table") -> None:
-        """Guarda los SChunks en disco via TreeStore"""
+        """
+        Persist columns into a single TreeStore container.
+        Each column is stored under a group / colname.
+        """
+        # mode='w' creates/overwrites; use 'a' to append/replace columns.
         with blosc2.TreeStore(urlpath, mode="w") as ts:
-            for name, schunk in self._cols.items():
+            arrays = self._cols
+            for name, arr in arrays.items():
                 node_path = f"{group}/{name}"
-                print(f"Storing {name} ({schunk.nitems} items) in {node_path}")
-                # SChunk se puede convertir a NDArray persistente en disco
-                ts[node_path] = schunk.to_ndarray()
+                # Store as compressed NDArray inside the tree
+                print(f"Storing {name} with shape {arr[:self._n_rows].shape} and dtype {arr.dtype} in {node_path}")
+                ts[node_path] = arr[:self._n_rows]
 
     @classmethod
-    def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> ColumnTable:
-        """Carga datos desde disco directamente a memoria comprimida (SChunk)"""
+    def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> ColumnTable_B2:
         with blosc2.TreeStore(urlpath, mode="r") as ts:
-            # 1. Descubrir columnas
-            prefix = f"/{group}/"
-            # Truco para listar claves en TreeStore actual
-            keys = [k for k in ts.root.iter_children() if k.startswith(group)]
-            # O usar nombres conocidos si row_type existe.
-            # Simplificación: asumimos que las claves son los nombres de archivo
+            keys = list(ts.keys()) if hasattr(ts, "keys") else []
+            prefix = f"/{group}/" if not group.startswith("/") else f"{group}/"
+            field_names = []
+            for k in keys:
+                k_norm = f"/{k.strip('/')}"
+                if k_norm.startswith(prefix):
+                    field_names.append(k_norm[len(prefix):])
 
-            # (Aquí iría la lógica de inferencia de modelo si row_type es None,
-            #  copiada de tu código original. Por brevedad, asumo row_type dado
-            #  o infiero básico).
+            field_names.sort()
+
+            b2_arrays: dict[str, blosc2.NDArray] = {}
+            annotations: dict[str, Any] = {}
+            defaults: dict[str, Any] = {}
+            loaded_nrows = 0
+
+            for field in field_names:
+                node_path = f"{group}/{field}"
+                stored_array = ts[node_path]
+                b2_arr = blosc2.asarray(stored_array)
+                b2_arrays[field] = b2_arr
+
+                if loaded_nrows == 0 and b2_arr.shape[0] > 0:
+                    loaded_nrows = b2_arr.shape[0]
+
+                if row_type is None:
+                    dt = b2_arr.dtype
+                    kind = dt.kind
+
+                    if kind == "U":
+                        char_size = np.dtype("U1").itemsize
+                        max_len = dt.itemsize // char_size
+                        annotations[field] = Annotated[str, MaxLen(int(max_len))]
+                        defaults[field] = Field(default="")
+                    elif kind == "S":
+                        max_len = dt.itemsize
+                        annotations[field] = Annotated[bytes, MaxLen(int(max_len))]
+                        defaults[field] = Field(default=b"")
+                    elif kind in ("i", "u"):
+                        annotations[field] = Annotated[int, NumpyDtype(dt)]
+                        defaults[field] = Field(default=0)
+                    elif kind == "f":
+                        annotations[field] = Annotated[float, NumpyDtype(dt)]
+                        defaults[field] = Field(default=0.0)
+                    elif kind == "c":
+                        annotations[field] = Annotated[complex, NumpyDtype(dt)]
+                        defaults[field] = Field(default=0j)
+                    elif kind == "b":
+                        annotations[field] = Annotated[bool, NumpyDtype(dt)]
+                        defaults[field] = Field(default=False)
+                    else:
+                        annotations[field] = Annotated[Any, NumpyDtype(dt)]
+                        defaults[field] = Field(default=None)
 
             if row_type is None:
-                # ... Inferencia (ver código original) ...
-                pass
+                model_fields = {}
+                for name, ann in annotations.items():
+                    model_fields[name] = (ann, defaults.get(name, ...))
+                row_type = create_model("InferredRowModel", __base__=BaseModel, **model_fields)
 
-            tbl = cls(row_type)
+            tbl = cls(row_type, capacity=max(1, loaded_nrows))
 
-            # 2. Cargar datos
-            for name in row_type.model_fields.keys():
-                node_path = f"{group}/{name}"
-                if node_path not in ts: continue
-
-                # Leemos el NDArray del disco
-                stored_arr = ts[node_path]
-
-                # CONVERSIÓN CRÍTICA: Disk NDArray -> RAM SChunk
-                # Creamos un SChunk en memoria con los mismos datos
-                # Esto carga y re-comprime en RAM (o copia si es compatible)
-                schunk = tbl._cols[name]
-
-                # Opción eficiente: copiar buffers.
-                # Opción fácil: leer todo a numpy y meterlo en SChunk
-                # Para datasets enormes, habría que hacerlo por bloques.
-                full_data = stored_arr[:]  # Descomprime todo a RAM temporalmente
-                schunk.append_data(full_data)  # Re-inserta en SChunk
-
-        return tbl
-
-    def __str__(self):
-        # Versión simplificada del print
-        if self.nrows == 0: return "Empty Table"
-        col_names = list(self._cols.keys())
-        header = " | ".join(f"{c:^10}" for c in col_names)
-        res = [header, "-" * len(header)]
-
-        # Imprimir primeras 10 filas
-        limit = min(10, self.nrows)
-        for i in range(limit):
-            row = [str(self._cols[c][i][0]) for c in col_names]  # [0] por dimensión extra
-            res.append(" | ".join(f"{r:^10}" for r in row))
-
-        return "\n".join(res)
-
-
-
-
-
-
+            tbl._cols = b2_arrays
+            tbl._n_rows = loaded_nrows
+            tbl._capacity = loaded_nrows
+            return tbl
 
 
 if __name__ == "__main__":
@@ -411,15 +471,6 @@ if __name__ == "__main__":
 
     print("Rows:", table.nrows)
 
-    # Persist
-    table.save(urlpath="people.b2z")
-
-    # Load back
-    loaded = ColumnTable.load(urlpath="people.b2z")
-    print("Loaded rows:", loaded.nrows)
-    print("Loaded name column:", loaded.to_numpy()["name"])
-    print("Loaded score column:", loaded.to_numpy()["score"])
-    print("Loaded score column:", loaded.to_numpy()["active"])
 
 
 
@@ -428,6 +479,7 @@ if __name__ == "__main__":
 
     print(f"names: {table["name"]}")
     print(f"names: {table.juanjo}")
+    print(f"Tabla:\n{table}")
 
 
     bol_vec = (table.id == 1) | (table.name == "Alice")
@@ -439,8 +491,33 @@ if __name__ == "__main__":
 
     print(f"Filtro: \n{table.filter(bol_vec)}")
 
+    tableb2 = ColumnTable_B2(RowModel)
+    tableb2.append({"id": 0, "name": "Alice", "score": 91.5})
+
+    tableb2.extend(
+        [
+            {"id": 1, "name": "bob", "score": 88.0, "active": False},
+            {"id": 3, "score": 88.0, "active": False},  # missing field
+            {"id": 2, "name": "carol", "score": 73.25},
+            {"id": 4, "name": "Alex", "score": 3.0, "active": True},
+
+        ]
+    )
 
 
+    print(f"Tabla:\n{tableb2}")
+
+    print(f"names: {(tableb2["id"] == 1)}")
+
+    tableb2.save(urlpath="people.b2z")
+
+    # Load back
+    loaded = ColumnTable_B2.load(urlpath="people.b2z")
+    print(loaded)
+    print("Loaded rows:", loaded.nrows)
+    print("Loaded name column:", loaded["name"])
+    print("Loaded score column:", loaded["score"])
+    print("Loaded score column:", loaded["active"])
 
 
 
