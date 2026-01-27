@@ -38,7 +38,7 @@ class RowModel(BaseModel):
     score: Annotated[float, NumpyDtype(np.float32)] = Field(ge=0, le=100)
     active: Annotated[bool, NumpyDtype(np.bool_)] = True
 
-'''
+
 class ColumnTable(Generic[RowT]):
 
     #_row_type -->
@@ -85,7 +85,7 @@ class ColumnTable(Generic[RowT]):
 
 
     def append(self, data: dict[str, Any] | RowT) -> None:
-        #Comprobar validez de dato?
+
         row = data if isinstance(data, self._row_type) else self._row_type(**data)
         for k, v in row.model_dump().items():
             self._cols[k].append(v)
@@ -99,12 +99,12 @@ class ColumnTable(Generic[RowT]):
         retval = ColumnTable(self._row_type)
         for i in range(len(ls)):
             if ls[i]:
-                retval.append(self.get_row(i))
+                retval.append(self.row(i))
         return retval
 
 
 
-    @property
+
     def row(self, index: int) -> RowT | None:
         num_rows = len(next(iter(self._cols.values()))) if self._cols else 0
         if not (0 <= index < num_rows):
@@ -231,107 +231,66 @@ class ColumnTable(Generic[RowT]):
 
 
 
-if __name__ == "__main__":
-    table = ColumnTable(RowModel)
-    table.append({"id": 0, "name": "Alice", "score": 91.5})
-    table.extend(
-        [
-            # {"id": 1, "name": "bob", "score": 88.0, "active": False},
-            {"id": 1, "score": 88.0, "active": False},  # missing field
-            {"id": 2, "name": "carol", "score": 73.25},
-        ]
-    )
-
-    print("Rows:", table.nrows)
-
-    # Persist
-    table.save(urlpath="people.b2z")
-
-    # Load back
-    loaded = ColumnTable.load(urlpath="people.b2z")
-    print("Loaded rows:", loaded.nrows)
-    print("Loaded name column:", loaded.to_numpy()["name"])
-    print("Loaded score column:", loaded.to_numpy()["score"])
-    print("Loaded score column:", loaded.to_numpy()["active"])
 
 
+class ColumnTable_B2(Generic[RowT]):
 
-    print("Segunda prueba")
-    #print(table)
-
-    print(f"names: {table["name"]}")
-    print(f"names: {table.juanjo}")
-
-
-    bol_vec = (table.id == 1) | (table.name == "Alice")
-    print(f"names: {bol_vec}")
-
-    print(f"fila 2: {table.row(2)}")
-
-    print(f"len(tabla): {len(table)}")
-
-    print(f"Filtro: \n{table.filter(bol_vec)}")
-'''
-
-
-class ColumnTable(Generic[RowT]):
     def __init__(self, row_type: type[RowT]):
         self._row_type = row_type
-        # MOTOR: Usamos SChunk (Super-Chunk) que permite append comprimido
-        self._cols: dict[str, blosc2.SChunk] = {}
+        self._cols: dict[str, blosc2.NDArray] = {}
+        shape = (512,512)
 
-        # Inicializamos columnas vacías con el tipo correcto
         for name, field in row_type.model_fields.items():
-            dtype = self._infer_dtype(field)
-            # Creamos SChunk optimizado:
-            # - chunksize=0 (automático)
-            # - cparams con zstd nivel 1 (balance velocidad/compresión)
-            cparams = {"codec": blosc2.Codec.ZSTD, "clevel": 1}
-            self._cols[name] = blosc2.SChunk(chunksize=0, dtype=dtype, cparams=cparams)
+            origin = getattr(field.annotation, "__origin__", field.annotation)
 
-    def _infer_dtype(self, field) -> np.dtype:
-        """Deduce el dtype de NumPy compatible con Blosc2 desde Pydantic"""
-        for md in getattr(field, "metadata", ()):
-            if isinstance(md, NumpyDtype):
-                return np.dtype(md.dtype)
-            if isinstance(md, MaxLen):
-                # Si es string, usamos Unicode fijo (U10) o Bytes fijos (S10)
-                if field.annotation is str:
-                    return np.dtype(f"U{md.length}")
-                if field.annotation is bytes:
-                    return np.dtype(f"S{md.length}")
+            if origin == str or field.annotation == str:
+                max_len = 32
+                if hasattr(field.annotation, "__metadata__"):
+                    for meta in field.annotation.__metadata__:
+                        if isinstance(meta, MaxLen):
+                            max_len = meta.max_length
+                            break
+                dt = np.dtype(f"U{max_len}")
 
-        # Fallbacks genéricos
-        if field.annotation is int: return np.dtype(np.int64)
-        if field.annotation is float: return np.dtype(np.float64)
-        if field.annotation is bool: return np.dtype(np.bool_)
-        raise ValueError(f"No se pudo inferir dtype para {field}")
+            elif origin == bytes or field.annotation == bytes:
+                max_len = 32
+                if hasattr(field.annotation, "__metadata__"):
+                    for meta in field.annotation.__metadata__:
+                        if isinstance(meta, MaxLen):
+                            max_len = meta.max_length
+                            break
+                dt = np.dtype(f"S{max_len}")
+
+            elif origin == int or field.annotation == int:
+                dt = np.int64
+
+            elif origin == float or field.annotation == float:
+                dt = np.float64
+
+            elif origin == bool or field.annotation == bool:
+                dt = np.bool_
+
+            elif origin == complex or field.annotation == complex:
+                dt = np.complex128
+
+            else:
+                dt = np.object_
+
+            self._cols[name] = blosc2.zeros(shape=shape, dtype=dt)
 
     def append(self, data: dict[str, Any] | RowT) -> None:
-        # Validación Pydantic
-        row = data if isinstance(data, self._row_type) else self._row_type(**data)
-
-        for name, val in row.model_dump().items():
-            schunk = self._cols[name]
-            # Convertimos el escalar a array 0-D/1-D compatible para Blosc2
-            # Esto es necesario porque SChunk.append_data espera buffer/array
-            arr_val = np.array([val], dtype=schunk.dtype)
-            schunk.append_data(arr_val)
+        ...
 
     def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
-        for r in rows:
-            self.append(r)
+       ...
 
     def __getitem__(self, s: str):
-        if s not in self._cols:
-            return None
-        # Convertimos SChunk -> NDArray (Vista rápida) para operar
-        return self._cols[s].to_ndarray()
+        ...
 
     def __getattr__(self, s: str):
         return self[s] if s in self._cols else super().__getattribute__(s)
 
-    def filter(self, expr_result) -> ColumnTable:
+    def filter(self, expr_result) -> ColumnTable_B2:
         """Filtra usando el resultado de una expresión Blosc2"""
         # Materializamos la máscara a numpy bool para iterar índices
         # (Esto es rápido porque es solo 1 bit por fila)
@@ -342,7 +301,7 @@ class ColumnTable(Generic[RowT]):
 
         indices = np.where(mask)[0]
 
-        retval = ColumnTable(self._row_type)
+        retval = ColumnTable_B2(self._row_type)
         # Copiamos fila a fila (se podría optimizar copiando chunks enteros)
         for i in indices:
             retval.append(self.get_row(int(i)))  # int(i) para evitar tipos numpy
@@ -433,33 +392,52 @@ class ColumnTable(Generic[RowT]):
         return "\n".join(res)
 
 
+
+
+
+
+
+
 if __name__ == "__main__":
     table = ColumnTable(RowModel)
-
-    # Prueba Append
     table.append({"id": 0, "name": "Alice", "score": 91.5})
-    table.extend([
-        {"id": 1, "score": 88.0, "active": False},
-        {"id": 2, "name": "Carol", "score": 73.25},
-    ])
+    table.extend(
+        [
+            # {"id": 1, "name": "bob", "score": 88.0, "active": False},
+            {"id": 1, "score": 88.0, "active": False},  # missing field
+            {"id": 2, "name": "carol", "score": 73.25},
+        ]
+    )
 
-    print(f"Tabla en memoria ({table.nrows} filas):")
-    print(table)
+    print("Rows:", table.nrows)
 
-    # Vectorización con Blosc2
-    # table.id devuelve un NDArray, la comparación devuelve un LazyExpr o bool array
-    print("\nPrueba Vectorización:")
-    # Nota: con strings a veces blosc2 requiere decode. Si falla, usar .to_numpy()
-    # bol_vec = (table.id[:] == 0) # [:] fuerza evaluación
+    # Persist
+    table.save(urlpath="people.b2z")
 
-    # Guardar y Cargar
-    print("\nGuardando...")
-    table.save("people_v2.b2z")
+    # Load back
+    loaded = ColumnTable.load(urlpath="people.b2z")
+    print("Loaded rows:", loaded.nrows)
+    print("Loaded name column:", loaded.to_numpy()["name"])
+    print("Loaded score column:", loaded.to_numpy()["score"])
+    print("Loaded score column:", loaded.to_numpy()["active"])
 
-    print("Cargando...")
-    loaded = ColumnTable.load("people_v2.b2z", row_type=RowModel)
-    print(f"Cargada ({loaded.nrows} filas). ID 0: {loaded.get_row(0)}")
 
+
+    print("Segunda prueba")
+    #print(table)
+
+    print(f"names: {table["name"]}")
+    print(f"names: {table.juanjo}")
+
+
+    bol_vec = (table.id == 1) | (table.name == "Alice")
+    print(f"names: {bol_vec}")
+
+    print(f"fila 2: {table.row(2)}")
+
+    print(f"len(tabla): {len(table)}")
+
+    print(f"Filtro: \n{table.filter(bol_vec)}")
 
 
 
