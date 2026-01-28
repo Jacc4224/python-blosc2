@@ -12,7 +12,8 @@ from os import wait
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 import numpy as np
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, ValidationError
+from pydantic.v1.class_validators import Validator
 
 import blosc2
 
@@ -230,16 +231,12 @@ class ColumnTable(Generic[RowT]):
 
 
 
-
-
-
-
 class ColumnTable_B2(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], capacity: int = 512):
+    def __init__(self, row_type: type[RowT]):
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
-        self._capacity: int = capacity
+        self._capacity: int = 1
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
 
@@ -247,8 +244,10 @@ class ColumnTable_B2(Generic[RowT]):
         for name, field in row_type.model_fields.items():
             origin = getattr(field.annotation, "__origin__", field.annotation)
 
+
+            # We need to check for other posibilities...
             if origin == str or field.annotation == str:
-                max_len = 32  # Default si no hay MaxLen
+                max_len = 32  # Default MaxLen
                 if hasattr(field.annotation, "__metadata__"):
                     for meta in field.annotation.__metadata__:
                         if isinstance(meta, MaxLen):
@@ -258,7 +257,7 @@ class ColumnTable_B2(Generic[RowT]):
                 display_width = max(10, min(max_len, 50))
 
             elif origin == bytes or field.annotation == bytes:
-                max_len = 32
+                max_len = 32    # Default MaxLen
                 if hasattr(field.annotation, "__metadata__"):
                     for meta in field.annotation.__metadata__:
                         if isinstance(meta, MaxLen):
@@ -269,34 +268,33 @@ class ColumnTable_B2(Generic[RowT]):
 
             elif origin == int or field.annotation == int:
                 dt = np.int64
-                display_width = 12  # Suficiente para enteros estándar
+                display_width = 12
 
             elif origin == float or field.annotation == float:
                 dt = np.float64
-                display_width = 15  # Espacio para decimales y notación científica
+                display_width = 15
 
             elif origin == bool or field.annotation == bool:
                 dt = np.bool_
-                display_width = 6  # "True" / "False" caben en 5-6
+                display_width = 6  # "True" / "False" fit in 5-6 chars
 
             elif origin == complex or field.annotation == complex:
                 dt = np.complex128
-                display_width = 25  # (1.23+4.56j) suele ser largo
-
+                display_width = 25
             else:
                 dt = np.object_
                 display_width = 20
 
             final_width = max(len(name), display_width)
-            self._col_widths[name] = final_width
+            self._col_widths[name] = final_width        # Usefull in __str__
 
-            self._cols[name] = blosc2.zeros(shape=capacity, dtype=dt)
+            self._cols[name] = blosc2.zeros(shape=1, dtype=dt)
 
     def __str__(self):
-        # Versión simplificada del print
         retval = []
-        # arrays = self.to_numpy()
         cont = 0
+
+        # We print the header
         for name in self._cols.keys():
             retval.append(f"{name:^{self._col_widths[name]}} |")
             cont += self._col_widths[name]+2
@@ -305,6 +303,8 @@ class ColumnTable_B2(Generic[RowT]):
             retval.append("-")
         retval.append("\n")
 
+
+        # We print the rows
         for i in range(self._n_rows):
             for name in self._cols.keys():
                 retval.append(f"{self._cols[name][i]:^{self._col_widths[name]}}")
@@ -326,14 +326,32 @@ class ColumnTable_B2(Generic[RowT]):
         return self._n_rows
 
     def append(self, data: dict[str, Any] | RowT) -> None:
-        #Falta comprobar que el tipo de datos de RowT coincide con el del diccionario
+        try:
+            row = data if isinstance(data, self._row_type) else self._row_type(**data)
+        except (TypeError, ValidationError) as e:
+            raise TypeError(
+                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
+                f"Details: {e}"
+            ) from e
 
-        if self._n_rows >= self._capacity:
-            self._capacity *= 2
+        if self._n_rows > 0:
+            self._capacity += 1
             for col_array in self._cols.values():
                 col_array.resize((self._capacity,))
 
-        row = data if isinstance(data, self._row_type) else self._row_type(**data)
+        for k, v in row.model_dump().items():
+            self._cols[k][self._n_rows] = v
+
+        self._n_rows += 1
+
+    def _appendExtend(self, data: dict[str, Any] | RowT) -> None:
+        try:
+            row = data if isinstance(data, self._row_type) else self._row_type(**data)
+        except (TypeError, ValidationError) as e:
+            raise TypeError(
+                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
+                f"Details: {e}"
+            ) from e
 
         for k, v in row.model_dump().items():
             self._cols[k][self._n_rows] = v
@@ -341,60 +359,67 @@ class ColumnTable_B2(Generic[RowT]):
         self._n_rows += 1
 
     def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
+
+        if self._n_rows > 0:
+            self._capacity += len(rows)
+        else:
+            self._capacity += len(rows)-1
+
+        for col_array in self._cols.values():
+            col_array.resize((self._capacity,))
+
         for r in rows:
-            self.append(r)
-
-    def row(self, index: int) -> RowT | None:
-        num_rows = self._n_rows
-        if not (0 <= index < num_rows):
-            return None
-
-        data = {
-            name: self._cols[name][index]
-            for name in self._cols.keys()
-        }
-
-        return self._row_type(**data)
-
-
+            self._appendExtend(r)
 
     def filter(self, expr_result) -> ColumnTable_B2:
         filtro = None
+        if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and expr_result.dtype == np.bool_):
+            raise TypeError(
+                f"Expected a boolean 'blosc2.NDArray' or 'blosc2.LazyExpr', "
+                f"but got type '{type(expr_result).__name__}' "
+                f"with dtype '{getattr(expr_result, 'dtype', 'N/A')}'."
+            )
         if isinstance(expr_result, blosc2.LazyExpr):
             filtro = expr_result.compute()
-        elif isinstance(expr_result, blosc2.NDArray):
+        elif isinstance(expr_result, blosc2.NDArray) or (expr_result.dtype != np.bool_):
             filtro = expr_result
-        else:
-            raise TypeError(f"El tipo {type(expr_result)} no es válido. Se esperaba blosc2.LazyExpr.")
 
-        retval = ColumnTable_B2(self._row_type, self._capacity)
+
+        retval = ColumnTable_B2(self._row_type)
         if filtro is not None and len(filtro) >= self._n_rows:
             for i in range(self._n_rows):
                 if filtro[i]:
                     retval.append(self.row(i))
+        else:
+            raise ValueError(
+                f"Filter length ({len(filtro)}) does not match the number of rows ({self._n_rows})."
+            )
         return retval
 
+    def row(self, ind: int) -> RowT | None:
+        """
+        ind could be an array/tuple/iter of index??
+        """
 
-
-
-    def row(self, index: int) -> RowT | None:
-        if not (0 <= index < self.nrows):
-            return None
+        if (0 <= ind < self._n_rows):
+            index: int = ind
+        elif (-self._n_rows <= ind < 0):
+            index: int = self._n_rows - ind
+        else:
+            raise IndexError("list index out of range")
 
         data = {}
-        for name, schunk in self._cols.items():
-            arr_val = schunk[index]  # Esto descomprime el chunk afectado
-            data[name] = arr_val[0] if isinstance(arr_val, (np.ndarray, blosc2.NDArray)) else arr_val
-
+        for name, col in self._cols.items():
+            arr_val = col[index]
+            data[name] = arr_val[()]
+        print(data)
         return self._row_type(**data)
-
 
     def save(self, urlpath: str, group: str = "table") -> None:
         """
         Persist columns into a single TreeStore container.
         Each column is stored under a group / colname.
         """
-        # mode='w' creates/overwrites; use 'a' to append/replace columns.
         with blosc2.TreeStore(urlpath, mode="w") as ts:
             arrays = self._cols
             for name, arr in arrays.items():
@@ -465,7 +490,7 @@ class ColumnTable_B2(Generic[RowT]):
                     model_fields[name] = (ann, defaults.get(name, ...))
                 row_type = create_model("InferredRowModel", __base__=BaseModel, **model_fields)
 
-            tbl = cls(row_type, capacity=max(1, loaded_nrows))
+            tbl = cls(row_type)
 
             tbl._cols = b2_arrays
             tbl._n_rows = loaded_nrows
@@ -474,41 +499,17 @@ class ColumnTable_B2(Generic[RowT]):
 
 
 if __name__ == "__main__":
-    '''
-    table = ColumnTable(RowModel)
-    table.append({"id": 0, "name": "Alice", "score": 91.5})
-    table.extend(
-        [
-            # {"id": 1, "name": "bob", "score": 88.0, "active": False},
-            {"id": 1, "score": 88.0, "active": False},  # missing field
-            {"id": 2, "name": "carol", "score": 73.25},
-        ]
-    )
-    print("Rows:", table.nrows)
-    ###########################################################################
-    ###########################################################################
-    ###########################################################################
 
-
-    
-    print("\n############ Segunda prueba #############\n")
-
-    print(f"names con getitem: {table["name"]}")
-    print(f"names con getattr: {table.name}")
-    print(f"Tabla: \n{table}")
-
-
-    bol_vec = (table.id == 1) | (table.name == "Alice")
-    print(f"names: {bol_vec}")
-    print(f"fila 2: {table.row(2)}")
-    print(f"len(tabla): {len(table)}")
-    print(f"Filtro: \n{table.filter(bol_vec)}")
-    '''
-    #Creamos nuestra tabla de prueba
+    #We create our Blosc2 CTable
+    #Capacity atribute set al 512 by default
     tableb2 = ColumnTable_B2(RowModel)
 
-    #Probamos a introducir datos de diferentes forman
+
+
+    #Lets try indexing  new elements
     tableb2.append({"id": 0, "name": "Alice", "score": 91.5})
+    print(f"Tabla:\n{tableb2} \n\n")
+
 
     tableb2.extend(
         [
@@ -520,27 +521,43 @@ if __name__ == "__main__":
         ]
     )
 
-    #preparamos una comparación
-    exp = ((tableb2["id"] == 1))
-    type(exp)
-    verdad = exp.compute()
+    # Append error example
+    # tableb2.append({"a": 6})
 
-    print(f"Tabla:\n{tableb2}")
-    print(f"names: {verdad[:tableb2.nrows]}")
-    print("\n\n")
+    # Lets see the full table
+    print(f"Tabla:\n{tableb2} \n\n")
 
-
+    # Save (using treestore)
     tableb2.save(urlpath="people.b2z")
 
     # Load back
     loaded = ColumnTable_B2.load(urlpath="people.b2z")
-    print("\n\n", loaded)
 
-    print(type([True, False, True, False]))
+    """
+        The Columns are shuffled, not the same order as before save
+    """
+
+
+    # We make a filter expresion
+    exp = ((tableb2["id"] == (tableb2.active + 1).compute()))
+    exp_no_bool = (tableb2.active + 1)
+    verdad = exp.compute()
+
+    # Filter from lazy expresion and from bool NDArray, both with the same outcome
     tableb2.filter(exp)
-    tableb2.filter(verdad)
-    #tableb2.filter([True, False, True, False]) #ejemplo de excepción
+    prnt = tableb2.filter(verdad)
+    print(prnt)
 
-    #print(tableb2.filter(verdad))
+    # Smaller filter size error examlpe
+    # arr = blosc2.asarray(np.array([True, False, True, False]))
+    # tableb2.filter(arr)
+
+    # Not same dtype error example
+    #tableb2.filter(exp_no_bool)
+
+    # Not NDArray error example
+    #tableb2.filter([True, False, True, False])
+
+
 
 
