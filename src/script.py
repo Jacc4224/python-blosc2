@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import Field
 from os import wait
-from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, Tuple
 
 import numpy as np
 from pydantic import BaseModel, Field, create_model, ValidationError
@@ -229,6 +229,12 @@ class ColumnTable(Generic[RowT]):
         return tbl
 
 
+class _RowIndexer:
+        def __init__(self, table):
+            self._table = table
+
+        def __getitem__(self, item):
+            return self._table.row(item)
 
 
 class ColumnTable_B2(Generic[RowT]):
@@ -325,6 +331,12 @@ class ColumnTable_B2(Generic[RowT]):
     def nrows(self) -> int:
         return self._n_rows
 
+    @property
+    def rows(self):
+        """Allows access to the table as follows table.rows[1:10]"""
+        return _RowIndexer(self)
+
+
     def append(self, data: dict[str, Any] | RowT) -> None:
         try:
             row = data if isinstance(data, self._row_type) else self._row_type(**data)
@@ -396,25 +408,49 @@ class ColumnTable_B2(Generic[RowT]):
             )
         return retval
 
-    def row(self, ind: int) -> RowT | None:
-        """
-        ind could be an array/tuple/iter of index??
-        """
+    def row(self, ind: int | slice | str) -> RowT | list[RowT]| None:
 
-        if (0 <= ind < self._n_rows):
-            index: int = ind
-        elif (-self._n_rows <= ind < 0):
-            index: int = self._n_rows - ind
-        else:
-            raise IndexError("list index out of range")
+        if isinstance(ind, str):
+            try:
+                parts = [p.strip() for p in ind.split(':')]
+                if len(parts) > 3 or len(parts) < 2:
+                    raise ValueError
 
-        data = {}
-        for name, col in self._cols.items():
-            arr_val = col[index]
-            data[name] = arr_val[()]
-        print(data)
-        return self._row_type(**data)
+                slice_args = [int(p) if p else None for p in parts]
 
+                return self.row(slice(*slice_args))
+
+            except ValueError:
+                raise ValueError(
+                    f"Invalid slice string format: '{ind}'. Expected format 'start:stop' or 'start:stop:step' with integers.")
+
+        if isinstance(ind, int):
+            if 0 <= ind < self._n_rows:
+                index: int = ind
+            elif -self._n_rows <= ind < 0:
+                index: int = self._n_rows + ind
+            else:
+                raise IndexError("list index out of range")
+
+            data = {}
+            for name, col in self._cols.items():
+                arr_val = col[index]
+                data[name] = arr_val[()]
+            '''if hasattr(arr_val, 'item'):
+                    data[name] = arr_val.item()
+                else:
+                    data[name] = arr_val'''
+            return self._row_type(**data)
+
+
+        if isinstance(ind, slice):
+            indices = range(*ind.indices(self._n_rows))
+            return [self.row(i) for i in indices]
+
+        raise  TypeError(
+        f"Invalid argument type. Expected 'int' or 'slice', "
+        f"but got '{type(ind).__name__}'."
+        )
     def save(self, urlpath: str, group: str = "table") -> None:
         """
         Persist columns into a single TreeStore container.
@@ -558,6 +594,21 @@ if __name__ == "__main__":
 
     # Not NDArray error example
     #tableb2.filter([True, False, True, False])
+
+    print('\n\n')
+
+
+    # The following expresions are equivalent
+    tableb2.row("0:3")  # and other slice convinations such as :3, 0:3:1
+    tableb2.row(slice(0,3))
+    [tableb2.row(i) for i in range(3)]
+    [tableb2.rows[i] for i in range(3)]
+    tableb2.rows[:3]    # and other slice convinations such as 0:3, :3:1
+
+
+
+    filas = tableb2.rows[:3]
+    print(filas)
 
 
 
