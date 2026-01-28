@@ -548,6 +548,7 @@ if __name__ == "__main__":
     prnt = tableb2.filter(verdad)
     print(prnt)
 
+
     # Smaller filter size error examlpe
     # arr = blosc2.asarray(np.array([True, False, True, False]))
     # tableb2.filter(arr)
