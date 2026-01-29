@@ -453,9 +453,14 @@ class ColumnTable_B2(Generic[RowT]):
 
         self._n_rows += 1
 
-    def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
-        if not isinstance(rows, Iterable) or isinstance(rows, dict):
-            raise TypeError("Expected an iterable of rows.")
+    def extend(self, rows: Iterable[dict[str, Any] | RowT] | ColumnTable_B2) -> None:
+        print(type( rows))
+
+        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, ColumnTable_B2)):
+            raise TypeError("Expected an iterable of rows or ColumnTable_B2.")
+
+        if isinstance(rows, ColumnTable_B2):
+            rows = rows.row[:]
 
         if self._n_rows > 0:
             self._capacity += len(rows)
@@ -761,8 +766,9 @@ if __name__ == "__main__":
 
     # Head and tail return a new table with the first and last n rows respectivley
     tableb2.head(5)
-    tableb2.tail(5)
+    print(type(tableb2.tail(5)))
 
+    tableb2.extend(tableb2.tail(5))
 
     print(tableb2)
 
