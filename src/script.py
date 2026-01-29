@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree)
 #######################################################################
 from __future__ import annotations
+from collections.abc import Iterable
 
 from dataclasses import Field
 from os import wait
@@ -234,17 +235,18 @@ class _RowIndexer:
             self._table = table
 
         def __getitem__(self, item):
-            return self._table.row(item)
+            return self._table._run_row_logic(item)
 
 
 class ColumnTable_B2(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT]):
+    def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
         self._capacity: int = 1
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
+        self.row = _RowIndexer(self)
 
 
         for name, field in row_type.model_fields.items():
@@ -296,6 +298,12 @@ class ColumnTable_B2(Generic[RowT]):
 
             self._cols[name] = blosc2.zeros(shape=1, dtype=dt)
 
+        if new_data is not None:
+            if isinstance(new_data, Iterable) and not isinstance(new_data, dict):
+                self.extend(new_data)
+            else:
+                self.append(new_data)
+
     def __str__(self):
         retval = []
         cont = 0
@@ -321,6 +329,31 @@ class ColumnTable_B2(Generic[RowT]):
             retval.append("\n")
         return "".join(retval)
 
+    def head(self, head: int = 1) -> None:
+        if not isinstance(head, int):
+            raise TypeError("tail must be an integer")
+
+        start = 0
+        end = min(self._n_rows, head)
+
+        row_to_add = self.row[start:end]
+
+        retval = ColumnTable_B2(self._row_type, row_to_add)
+        return retval
+
+    def tail(self, tail: int = 1) -> None:
+        if not isinstance(tail, int):
+            raise TypeError("tail must be an integer")
+
+        end = self._n_rows
+        start = max(0, self._n_rows-tail)
+
+        row_to_add = self.row[start:end]
+
+        retval = ColumnTable_B2(self._row_type, row_to_add)
+        return retval
+
+
     def __getitem__(self, s: str):
         return self._cols[s] if s in self._cols else None
 
@@ -330,12 +363,6 @@ class ColumnTable_B2(Generic[RowT]):
     @property
     def nrows(self) -> int:
         return self._n_rows
-
-    @property
-    def rows(self):
-        """Allows access to the table as follows table.rows[1:10]"""
-        return _RowIndexer(self)
-
 
     def append(self, data: dict[str, Any] | RowT) -> None:
         try:
@@ -371,6 +398,8 @@ class ColumnTable_B2(Generic[RowT]):
         self._n_rows += 1
 
     def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
+        if not isinstance(rows, Iterable) or isinstance(rows, dict):
+            raise TypeError("Expected an iterable of rows.")
 
         if self._n_rows > 0:
             self._capacity += len(rows)
@@ -401,14 +430,14 @@ class ColumnTable_B2(Generic[RowT]):
         if filtro is not None and len(filtro) >= self._n_rows:
             for i in range(self._n_rows):
                 if filtro[i]:
-                    retval.append(self.row(i))
+                    retval.append(self.row[i])
         else:
             raise ValueError(
                 f"Filter length ({len(filtro)}) does not match the number of rows ({self._n_rows})."
             )
         return retval
 
-    def row(self, ind: int | slice | str) -> RowT | list[RowT]| None:
+    def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
 
         if isinstance(ind, str):
             try:
@@ -418,7 +447,7 @@ class ColumnTable_B2(Generic[RowT]):
 
                 slice_args = [int(p) if p else None for p in parts]
 
-                return self.row(slice(*slice_args))
+                return self._run_row_logic(slice(*slice_args))
 
             except ValueError:
                 raise ValueError(
@@ -445,12 +474,13 @@ class ColumnTable_B2(Generic[RowT]):
 
         if isinstance(ind, slice):
             indices = range(*ind.indices(self._n_rows))
-            return [self.row(i) for i in indices]
+            return [self._run_row_logic(i) for i in indices]
 
         raise  TypeError(
         f"Invalid argument type. Expected 'int' or 'slice', "
         f"but got '{type(ind).__name__}'."
         )
+
     def save(self, urlpath: str, group: str = "table") -> None:
         """
         Persist columns into a single TreeStore container.
@@ -538,24 +568,80 @@ if __name__ == "__main__":
 
     #We create our Blosc2 CTable
     #Capacity atribute set al 512 by default
-    tableb2 = ColumnTable_B2(RowModel)
 
 
-
-    #Lets try indexing  new elements
-    tableb2.append({"id": 0, "name": "Alice", "score": 91.5})
-    print(f"Tabla:\n{tableb2} \n\n")
-
-
-    tableb2.extend(
-        [
+    datos_1 = {"id": 0, "name": "Alice", "score": 91.5}
+    datos_2 = [
             {"id": 1, "name": "bob", "score": 88.0, "active": False},
             {"id": 3, "score": 88.0, "active": False},  # missing field
             {"id": 2, "name": "carol", "score": 73.25},
             {"id": 4, "name": "Alex", "score": 3.0, "active": True},
 
-        ]
-    )
+            ]
+    datos_3 = {"id": 5, "name": "Jorge", "score": 42.0}
+
+    datos_4 = [{"id": 0, "name": "Alice", "score": 91.5},
+                 {"id": 1, "name": "Bob", "score": 88.0, "active": False},
+                 {"id": 2, "score": 88.0, "active": False},
+                 {"id": 3, "name": "Carol", "score": 73.25},
+                 {"id": 4, "name": "Alex", "score": 3.0, "active": True},
+                 {"id": 5, "name": "Jorge", "score": 42.0},
+                 {"id": 6, "name": "Diana", "score": 95.5, "active": True},
+                 {"id": 7, "name": "Elena", "score": 67.25},
+                 {"id": 8, "score": 82.0, "active": True},
+                 {"id": 9, "name": "Franco", "score": 76.5, "active": False},
+                 {"id": 10, "name": "Gabriela", "score": 89.0},
+                 {"id": 11, "name": "Héctor", "score": 55.75, "active": True},
+                 {"id": 12, "score": 91.25, "active": False},
+                 {"id": 13, "name": "Isabel", "score": 84.0},
+                 {"id": 14, "name": "Javier", "score": 72.5, "active": True},
+                 {"id": 15, "name": "Karen", "score": 93.0},
+                 {"id": 16, "name": "Luis", "score": 68.75, "active": False},
+                 {"id": 17, "score": 87.5, "active": True},
+                 {"id": 18, "name": "Marta", "score": 79.25},
+                 {"id": 19, "name": "Nicolás", "score": 85.5, "active": False},
+                 {"id": 20, "name": "Olivia", "score": 92.0},
+                 {"id": 21, "name": "Pablo", "score": 61.0, "active": True},
+                 {"id": 22, "score": 80.75, "active": False},
+                 {"id": 23, "name": "Quentin", "score": 75.25},
+                 {"id": 24, "name": "Rosa", "score": 88.5, "active": True},
+                 {"id": 25, "name": "Santiago", "score": 69.0},
+                 {"id": 26, "name": "Teresa", "score": 94.75, "active": False},
+                 {"id": 27, "score": 83.0, "active": True},
+                 {"id": 28, "name": "Ulises", "score": 77.5},
+                 {"id": 29, "name": "Valeria", "score": 86.25, "active": False},
+                 {"id": 30, "name": "Wanda", "score": 90.0},
+                 {"id": 31, "name": "Xavier", "score": 64.75, "active": True},
+                 {"id": 32, "score": 81.5, "active": False},
+                 {"id": 33, "name": "Yolanda", "score": 74.0},
+                 {"id": 34, "name": "Zara", "score": 87.25, "active": True},
+                 {"id": 35, "name": "Andrés", "score": 70.5},
+                 {"id": 36, "name": "Beatriz", "score": 93.5, "active": False},
+                 {"id": 37, "score": 85.75, "active": True},
+                 {"id": 38, "name": "Carlos", "score": 78.0},
+                 {"id": 39, "name": "Daniela", "score": 89.5, "active": False},
+                 {"id": 40, "name": "Enrique", "score": 66.25},
+                 {"id": 41, "name": "Fernanda", "score": 92.5, "active": True},
+                 {"id": 42, "score": 84.0, "active": False},
+                 {"id": 43, "name": "Gustavo", "score": 71.75},
+                 {"id": 44, "name": "Herminia", "score": 88.25, "active": True},
+                 {"id": 45, "name": "Ignacio", "score": 63.5},
+                 {"id": 46, "name": "Justina", "score": 95.0, "active": False},
+                 {"id": 47, "score": 86.5, "active": True},
+                 {"id": 48, "name": "Kevin", "score": 76.75},
+                 {"id": 49, "name": "Laura", "score": 90.5, "active": False}
+                ]
+
+
+    # Lets try indexing  new elements
+    tableb2 = ColumnTable_B2(RowModel, datos_1)
+    tableb2.extend(datos_2)
+    tableb2.append(datos_3)
+
+
+
+    tableb2 = ColumnTable_B2(RowModel, datos_4)
+
 
     # Append error example
     # tableb2.append({"a": 6})
@@ -575,9 +661,10 @@ if __name__ == "__main__":
 
 
     # We make a filter expresion
-    exp = ((tableb2["id"] == (tableb2.active + 1).compute()))
+    exp = ((tableb2["score"] > 50) & (tableb2["active"] == True))
     exp_no_bool = (tableb2.active + 1)
     verdad = exp.compute()
+
 
     # Filter from lazy expresion and from bool NDArray, both with the same outcome
     tableb2.filter(exp)
@@ -599,17 +686,28 @@ if __name__ == "__main__":
 
 
     # The following expresions are equivalent
-    tableb2.row("0:3")  # and other slice convinations such as :3, 0:3:1
-    tableb2.row(slice(0,3))
-    [tableb2.row(i) for i in range(3)]
-    [tableb2.rows[i] for i in range(3)]
-    tableb2.rows[:3]    # and other slice convinations such as 0:3, :3:1
+
+    tableb2.row[:3]    # and other slice combinations such as 0:3, :3:1
 
 
 
-    filas = tableb2.rows[:3]
+    filas = tableb2.row["1:3"]
     print(filas)
 
+    tableb2._cols["id"].shape
 
 
+    print(tableb2["name"].dtype)
 
+
+    # Head and tail return a new table with the first and last n rows respectivley
+    tableb2.head(5)
+    tableb2.tail(5)
+
+
+    """ Esto no funciona
+
+    target_name = np.array('unknown')
+    (tableb2["name"] == target_name).compute()
+    
+    """
