@@ -714,6 +714,7 @@ __all__ = [  # noqa : RUF022
     "count_nonzero",
     "cparams_dflts",
     "cpu_info",
+    "ctable",
     "decompress",
     "decompress2",
     "detect_number_of_cores",
