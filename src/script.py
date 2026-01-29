@@ -13,6 +13,7 @@ from os import wait
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, Tuple
 
 import numpy as np
+from numpy.ma.core import resize
 from pydantic import BaseModel, Field, create_model, ValidationError
 from pydantic.v1.class_validators import Validator
 
@@ -41,193 +42,13 @@ class RowModel(BaseModel):
     score: Annotated[float, NumpyDtype(np.float32)] = Field(ge=0, le=100)
     active: Annotated[bool, NumpyDtype(np.bool_)] = True
 
-
-class ColumnTable(Generic[RowT]):
-
-    #_row_type -->
-    #_cols --> diccionario de listas.
-
-
-    def __init__(self, row_type: type[RowT]):
-        self._row_type = row_type
-        self._cols: dict[str, list[Any]] = {f: [] for f in row_type.model_fields}
-
-    def __str__(self):
-        retval = []
-        #arrays = self.to_numpy()
-        cont = 0
-        for name in self._cols.keys():
-            retval.append(f"{name:<{15}} |")
-            cont += 1
-        retval.append("\n")
-        for i in range(cont):
-            retval.append("-----------------")
-        retval.append("\n")
-
-        for i in range(len(next(iter(self._cols.values())))):
-            for name in self._cols.keys():
-                retval.append(f"{self._cols[name][i]:<{15}}")
-                retval.append(f" |")
-            retval.append("\n")
-            for i in range(cont):
-                retval.append("-----------------")
-            retval.append("\n")
-        return "".join(retval)
-
-
-    def __len__(self) -> int:
-        return self.nrows
-
-    def __getitem__(self, s: str):
-        arrays = self.to_numpy()
-        return arrays[s] if s in arrays.keys() else None
-
-    def __getattr__(self, s: str):
-        arrays = self.to_numpy()
-        return arrays[s] if s in arrays.keys() else None
-
-
-    def append(self, data: dict[str, Any] | RowT) -> None:
-
-        row = data if isinstance(data, self._row_type) else self._row_type(**data)
-        for k, v in row.model_dump().items():
-            self._cols[k].append(v)
-
-    def extend(self, rows: Iterable[dict[str, Any] | RowT]) -> None:
-        for r in rows:      #Falta comprobar que sean válidos o delegar a append?
-            self.append(r)
-
-
-    def filter(self, ls: list[bool]) -> ColumnTable:
-        retval = ColumnTable(self._row_type)
-        for i in range(len(ls)):
-            if ls[i]:
-                retval.append(self.row(i))
-        return retval
+class RowModel2(BaseModel):
+    id: Annotated[int, NumpyDtype(np.int16)] = Field(ge=0)
+    #name: Annotated[str, MaxLen(10)] = Field(default="unknown")
+    name: Annotated[bytes, MaxLen(10)] = Field(default=b"unknown")
 
 
 
-
-    def row(self, index: int) -> RowT | None:
-        num_rows = len(next(iter(self._cols.values()))) if self._cols else 0
-        if not (0 <= index < num_rows):
-            return None
-
-        data = {
-            name: self._cols[name][index]
-            for name in self._cols.keys()
-        }
-
-        return self._row_type(**data)
-
-    @property
-    def nrows(self) -> int:
-        return len(next(iter(self._cols.values()))) if self._cols else 0
-
-    def to_numpy(self) -> dict[str, np.ndarray]:
-        out: dict[str, np.ndarray] = {}
-        for name, values in self._cols.items():
-            field_info = self._row_type.model_fields[name]
-            numpy_dtype = None
-            max_length = None
-            for md in getattr(field_info, "metadata", ()):
-                if isinstance(md, NumpyDtype):
-                    numpy_dtype = md.dtype
-                if isinstance(md, MaxLen):
-                    max_length = md.length
-
-            base_ann = field_info.annotation
-            if base_ann in (str, bytes):
-                if max_length is None:
-                    raise ValueError(f"Missing MaxLen for column '{name}'")
-                dtype = f"U{max_length}" if base_ann is str else f"S{max_length}"
-                out[name] = np.array(values, dtype=dtype)
-                continue
-
-            out[name] = np.array(values, dtype=numpy_dtype)
-        return out
-
-    def save(self, urlpath: str, group: str = "table") -> None:
-        """
-        Persist columns into a single TreeStore container.
-        Each column is stored under a group / colname.
-        """
-        # mode='w' creates/overwrites; use 'a' to append/replace columns.
-        with blosc2.TreeStore(urlpath, mode="w") as ts:
-            arrays = self.to_numpy()
-            for name, arr in arrays.items():
-                node_path = f"{group}/{name}"
-                # Store as compressed NDArray inside the tree
-                print(f"Storing {name} with shape {arr.shape} and dtype {arr.dtype} in {node_path}")
-                ts[node_path] = arr
-
-    @classmethod
-    def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> ColumnTable:  # noqa: C901
-        """
-        If `row_type` is provided, behave as before. If `row_type` is None,
-        infer a BaseModel from the stored arrays' dtypes and construct a model
-        using `create_model`.
-        """
-        with blosc2.TreeStore(urlpath, mode="r") as ts:
-            # discover stored column node paths under the group
-            keys = list(ts.keys()) if hasattr(ts, "keys") else []
-            prefix = f"/{group}/"
-            field_names = sorted(k[len(prefix) :] for k in keys if k.startswith(prefix))
-
-            # read arrays and infer annotations/metadata
-            arrays: dict[str, np.ndarray] = {}
-            annotations: dict[str, Any] = {}
-            defaults: dict[str, Any] = {}
-
-            for field in field_names:
-                node_path = f"{group}/{field}"
-                nda = ts[node_path]
-                arr = np.asarray(nda)
-                arrays[field] = arr
-
-                dt = arr.dtype
-                kind = dt.kind
-
-                if kind == "U":
-                    # numpy 'U' itemsize is bytes; deduce char length using U1 itemsize
-                    char_size = np.dtype("U1").itemsize
-                    max_len = dt.itemsize // char_size
-                    annotations[field] = Annotated[str, MaxLen(int(max_len))]
-                    defaults[field] = Field(default="")
-                elif kind == "S":
-                    max_len = dt.itemsize
-                    annotations[field] = Annotated[bytes, MaxLen(int(max_len))]
-                    defaults[field] = Field(default=b"")
-                elif kind in ("i", "u"):  # signed/unsigned ints
-                    annotations[field] = Annotated[int, NumpyDtype(dt)]
-                    defaults[field] = Field(default=0)
-                elif kind == "f":
-                    annotations[field] = Annotated[float, NumpyDtype(dt)]
-                    defaults[field] = Field(default=0.0)
-                elif kind == "c":
-                    annotations[field] = Annotated[complex, NumpyDtype(dt)]
-                    defaults[field] = Field(default=0j)
-                elif kind == "b":
-                    annotations[field] = Annotated[bool, NumpyDtype(dt)]
-                    defaults[field] = Field(default=False)
-                else:
-                    # fallback: keep dtype metadata and Any annotation
-                    annotations[field] = Annotated[Any, NumpyDtype(dt)]
-                    defaults[field] = Field(default=None)
-
-            # if a row_type was supplied, prefer it; otherwise build an inferred model
-            if row_type is None:
-                model_fields = {}
-                for name, ann in annotations.items():
-                    model_fields[name] = (ann, defaults[name])
-                row_type = create_model("InferredRowModel", __base__=BaseModel, **model_fields)  # type: ignore
-
-            # instantiate table and populate columns
-            tbl = cls(row_type)
-            for name, arr in arrays.items():
-                # convert bytes fields to python bytes if needed; keep lists
-                tbl._cols[name] = arr.tolist()
-        return tbl
 
 
 class _RowIndexer:
@@ -400,6 +221,29 @@ class ColumnTable_B2(Generic[RowT]):
     def nrows(self) -> int:
         return self._n_rows
 
+    @property
+    def ncols(self) -> int:
+        return len(self._cols)
+
+    def info(self):
+        """
+        nºColumns:
+        nºRows:
+        Key:
+
+        #   Column  Non-Null Count  Dtype
+       ---  ------  --------------  -----
+        0   id      50 non-null     int64
+        1   name    50 non-null     <U32
+        2   score   50 non-null     float32
+        3   a
+
+        memory usage:
+
+
+        """
+        ...
+
     def append(self, data: dict[str, Any] | RowT) -> None:
         try:
             row = data if isinstance(data, self._row_type) else self._row_type(**data)
@@ -425,8 +269,36 @@ class ColumnTable_B2(Generic[RowT]):
 
         self._n_rows += 1
 
-    def delete(self, data: dict[str, Any] | RowT) -> None:
-        ...
+    def delete(self, pos: int | list[int]) -> None:
+        if isinstance(pos, list):
+            if not isinstance(pos[0], int):
+                raise TypeError("Position must be an integer or a list of integers")
+            desp = 1
+            for i in range(min(pos), self._n_rows-len(pos)):
+                for v in self._cols.values():
+                    while(i+desp in pos):
+                        desp += 1
+                    v[i] = v[i + desp]
+            self._capacity = self._capacity - len(pos)
+            for col_array in self._cols.values():
+                col_array.resize((self._capacity,))
+            self._n_rows = self._n_rows - len(pos)
+        elif isinstance(pos, int):
+            if pos > self._n_rows:
+                raise IndexError("Index out of range")
+            elif pos < 0:
+                pos = self._n_rows + pos
+
+            for i in range(pos, self._n_rows-1):
+                for v in self._cols.values():
+                    v[i] = v[i+1]
+            self._capacity = self._capacity -1
+            for col_array in self._cols.values():
+                col_array.resize((self._capacity,))
+            self._n_rows = self._n_rows-1
+
+        else:
+            raise TypeError("Position must be an integer or a list of integers")
 
     def _appendExtend(self, data: dict[str, Any] | RowT) -> None:
         try:
@@ -454,24 +326,31 @@ class ColumnTable_B2(Generic[RowT]):
         self._n_rows += 1
 
     def extend(self, rows: Iterable[dict[str, Any] | RowT] | ColumnTable_B2) -> None:
-        print(type( rows))
-
         if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, ColumnTable_B2)):
             raise TypeError("Expected an iterable of rows or ColumnTable_B2.")
-
         if isinstance(rows, ColumnTable_B2):
-            rows = rows.row[:]
+            if rows._row_type != self._row_type:
+                raise TypeError("Tables are not the same type.")
 
-        if self._n_rows > 0:
-            self._capacity += len(rows)
+            self._capacity = self._capacity + rows.nrows
+            for col_array in self._cols.values():
+                col_array.resize((self._capacity,))
+
+            for k in rows._cols.keys():
+                self._cols[k][self._n_rows:] = rows._cols[k][:]
+            self._n_rows += rows.nrows
+
         else:
-            self._capacity += len(rows)-1
+            if self._n_rows > 0:
+                self._capacity += len(rows)
+            else:
+                self._capacity += len(rows)-1
 
-        for col_array in self._cols.values():
-            col_array.resize((self._capacity,))
+            for col_array in self._cols.values():
+                col_array.resize((self._capacity,))
 
-        for r in rows:
-            self._appendExtend(r)
+            for r in rows:
+                self._appendExtend(r)
 
     def filter(self, expr_result) -> ColumnTable_B2:
         filtro = None
@@ -698,6 +577,8 @@ if __name__ == "__main__":
                  {"id": 49, "name": "Laura", "score": 90.5, "active": False}
                 ]
 
+    data_5 = {"id": 4, "name": "Jorge"}
+
 
     # Lets try indexing  new elements with key="id"
     tableb2 = ColumnTable_B2(RowModel, data_1, key="id")
@@ -716,6 +597,8 @@ if __name__ == "__main__":
     # Lets see the full table
     print(f"Tabla:\n{tableb2} \n\n")
 
+
+    ##############################################################################
     # Save (using treestore)
     tableb2.save(urlpath="people.b2z")
 
@@ -725,7 +608,7 @@ if __name__ == "__main__":
     """
         The Columns are shuffled, not the same order as before save
     """
-
+    ##############################################################################
 
     # We make a filter expresion
     exp = ((tableb2["score"] > 50) & (tableb2["active"] == True))
@@ -756,26 +639,34 @@ if __name__ == "__main__":
 
     tableb2.row[:3]    # and other slice combinations such as 0:3, :3:1
     filas = tableb2.row["1:3"]
-    print(filas)
-
-    tableb2._cols["id"].shape
 
 
     print(tableb2["name"].dtype)
 
 
     # Head and tail return a new table with the first and last n rows respectivley
+    tableb2.tail(5)
     tableb2.head(5)
-    print(type(tableb2.tail(5)))
 
-    tableb2.extend(tableb2.tail(5))
+
+
+
+    table_extension_fail = ColumnTable_B2(RowModel2, data_5, key="id")
+
+    # tableb2.extend(table_extension_fail)
+    tableb2.extend(tableb2.head(3))
+
+    tableb2.delete([1, 2, 3, 5, 7, 8])
+    tableb2.delete(0)
 
     print(tableb2)
 
 
-    """ Esto no funciona
 
-    target_name = np.array('unknown')
-    (tableb2["name"] == target_name).compute()
-    
-    """
+    """ Esto no funciona """
+
+
+    '''target_name = blosc2.full(shape=(tableb2.nrows,), fill_value="unknown", dtype="<U32")
+
+    lzExp = (tableb2["name"] == "unknown")
+    cmptExp = lzExp.compute()'''
