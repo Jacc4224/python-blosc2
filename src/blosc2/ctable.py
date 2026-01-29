@@ -9,13 +9,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from dataclasses import Field
-from os import wait
-from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, Tuple
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 import numpy as np
-from numpy.ma.core import resize
 from pydantic import BaseModel, Field, create_model, ValidationError
-from pydantic.v1.class_validators import Validator
 
 import blosc2
 
@@ -59,7 +56,7 @@ class _RowIndexer:
             return self._table._run_row_logic(item)
 
 
-class ColumnTable_B2(Generic[RowT]):
+class CTable(Generic[RowT]):
 
     def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None, key: str = None) -> None:
         self._row_type = row_type
@@ -159,7 +156,7 @@ class ColumnTable_B2(Generic[RowT]):
 
         row_to_add = self.row[start:end]
 
-        retval = ColumnTable_B2(self._row_type, row_to_add)
+        retval = CTable(self._row_type, row_to_add)
         return retval
 
     def tail(self, tail: int = 1) -> None:
@@ -171,7 +168,7 @@ class ColumnTable_B2(Generic[RowT]):
 
         row_to_add = self.row[start:end]
 
-        retval = ColumnTable_B2(self._row_type, row_to_add)
+        retval = CTable(self._row_type, row_to_add)
         return retval
 
     def __getitem__(self, s: str):
@@ -325,10 +322,10 @@ class ColumnTable_B2(Generic[RowT]):
 
         self._n_rows += 1
 
-    def extend(self, rows: Iterable[dict[str, Any] | RowT] | ColumnTable_B2) -> None:
-        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, ColumnTable_B2)):
-            raise TypeError("Expected an iterable of rows or ColumnTable_B2.")
-        if isinstance(rows, ColumnTable_B2):
+    def extend(self, rows: Iterable[dict[str, Any] | RowT] | CTable) -> None:
+        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, CTable)):
+            raise TypeError("Expected an iterable of rows or blosc2.CTable.")
+        if isinstance(rows, CTable):
             if rows._row_type != self._row_type:
                 raise TypeError("Tables are not the same type.")
 
@@ -352,7 +349,7 @@ class ColumnTable_B2(Generic[RowT]):
             for r in rows:
                 self._appendExtend(r)
 
-    def filter(self, expr_result) -> ColumnTable_B2:
+    def filter(self, expr_result) -> CTable:
         filtro = None
         if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and expr_result.dtype == np.bool_):
             raise TypeError(
@@ -366,7 +363,7 @@ class ColumnTable_B2(Generic[RowT]):
             filtro = expr_result
 
 
-        retval = ColumnTable_B2(self._row_type)
+        retval = CTable(self._row_type)
         if filtro is not None and len(filtro) >= self._n_rows:
             for i in range(self._n_rows):
                 if filtro[i]:
@@ -440,7 +437,7 @@ class ColumnTable_B2(Generic[RowT]):
                 ts[node_path] = arr[:self._n_rows]
 
     @classmethod
-    def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> ColumnTable_B2:
+    def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> CTable:
         with blosc2.TreeStore(urlpath, mode="r") as ts:
             keys = list(ts.keys()) if hasattr(ts, "keys") else []
             prefix = f"/{group}/" if not group.startswith("/") else f"{group}/"
@@ -508,165 +505,3 @@ class ColumnTable_B2(Generic[RowT]):
             tbl._capacity = loaded_nrows
             return tbl
 
-
-if __name__ == "__main__":
-
-    #We create our Blosc2 CTable
-    #Capacity atribute set al 512 by default
-
-
-    data_1 = {"id": 0, "name": "Alice", "score": 91.5}
-    data_2 = [
-            {"id": 1, "name": "bob", "score": 88.0, "active": False},
-            {"id": 2, "score": 88.0, "active": False},  # missing field
-            {"id": 3, "name": "carol", "score": 73.25},
-            {"id": 4, "name": "Alex", "score": 3.0, "active": True},
-
-            ]
-    data_3 = {"id": 4, "name": "Jorge", "score": 42.0}
-
-    data_4 = [{"id": 0, "name": "Alice", "score": 91.5},
-                 {"id": 1, "name": "Bob", "score": 88.0, "active": False},
-                 {"id": 2, "score": 88.0, "active": False},
-                 {"id": 3, "name": "Carol", "score": 73.25},
-                 {"id": 4, "name": "Alex", "score": 3.0, "active": True},
-                 {"id": 5, "name": "Jorge", "score": 42.0},
-                 {"id": 6, "name": "Diana", "score": 95.5, "active": True},
-                 {"id": 7, "name": "Elena", "score": 67.25},
-                 {"id": 8, "score": 82.0, "active": True},
-                 {"id": 9, "name": "Franco", "score": 76.5, "active": False},
-                 {"id": 10, "name": "Gabriela", "score": 89.0},
-                 {"id": 11, "name": "Héctor", "score": 55.75, "active": True},
-                 {"id": 12, "score": 91.25, "active": False},
-                 {"id": 13, "name": "Isabel", "score": 84.0},
-                 {"id": 14, "name": "Javier", "score": 72.5, "active": True},
-                 {"id": 15, "name": "Karen", "score": 93.0},
-                 {"id": 16, "name": "Luis", "score": 68.75, "active": False},
-                 {"id": 17, "score": 87.5, "active": True},
-                 {"id": 18, "name": "Marta", "score": 79.25},
-                 {"id": 19, "name": "Nicolás", "score": 85.5, "active": False},
-                 {"id": 20, "name": "Olivia", "score": 92.0},
-                 {"id": 21, "name": "Pablo", "score": 61.0, "active": True},
-                 {"id": 22, "score": 80.75, "active": False},
-                 {"id": 23, "name": "Quentin", "score": 75.25},
-                 {"id": 24, "name": "Rosa", "score": 88.5, "active": True},
-                 {"id": 25, "name": "Santiago", "score": 69.0},
-                 {"id": 26, "name": "Teresa", "score": 94.75, "active": False},
-                 {"id": 27, "score": 83.0, "active": True},
-                 {"id": 28, "name": "Ulises", "score": 77.5},
-                 {"id": 29, "name": "Valeria", "score": 86.25, "active": False},
-                 {"id": 30, "name": "Wanda", "score": 90.0},
-                 {"id": 31, "name": "Xavier", "score": 64.75, "active": True},
-                 {"id": 32, "score": 81.5, "active": False},
-                 {"id": 33, "name": "Yolanda", "score": 74.0},
-                 {"id": 34, "name": "Zara", "score": 87.25, "active": True},
-                 {"id": 35, "name": "Andrés", "score": 70.5},
-                 {"id": 36, "name": "Beatriz", "score": 93.5, "active": False},
-                 {"id": 37, "score": 85.75, "active": True},
-                 {"id": 38, "name": "Carlos", "score": 78.0},
-                 {"id": 39, "name": "Daniela", "score": 89.5, "active": False},
-                 {"id": 40, "name": "Enrique", "score": 66.25},
-                 {"id": 41, "name": "Fernanda", "score": 92.5, "active": True},
-                 {"id": 42, "score": 84.0, "active": False},
-                 {"id": 43, "name": "Gustavo", "score": 71.75},
-                 {"id": 44, "name": "Herminia", "score": 88.25, "active": True},
-                 {"id": 45, "name": "Ignacio", "score": 63.5},
-                 {"id": 46, "name": "Justina", "score": 95.0, "active": False},
-                 {"id": 47, "score": 86.5, "active": True},
-                 {"id": 48, "name": "Kevin", "score": 76.75},
-                 {"id": 49, "name": "Laura", "score": 90.5, "active": False}
-                ]
-
-    data_5 = {"id": 4, "name": "Jorge"}
-
-
-    # Lets try indexing  new elements with key="id"
-    tableb2 = ColumnTable_B2(RowModel, data_1, key="id")
-    tableb2.extend(data_2)
-    # tableb2.append(data_3) # key="id" in data_3 is the same as in data_i: KeyError
-
-
-
-    tableb2 = ColumnTable_B2(RowModel, data_4)
-
-
-
-    # Append error example
-    # tableb2.append({"a": 6})
-
-    # Lets see the full table
-    print(f"Tabla:\n{tableb2} \n\n")
-
-
-    ##############################################################################
-    # Save (using treestore)
-    tableb2.save(urlpath="people.b2z")
-
-    # Load back
-    loaded = ColumnTable_B2.load(urlpath="people.b2z")
-
-    """
-        The Columns are shuffled, not the same order as before save
-    """
-    ##############################################################################
-
-    # We make a filter expresion
-    exp = ((tableb2["score"] > 50) & (tableb2["active"] == True))
-    exp_no_bool = (tableb2.active + 1)
-    verdad = exp.compute()
-
-
-    # Filter from lazy expresion and from bool NDArray, both with the same outcome
-    tableb2.filter(exp)
-    prnt = tableb2.filter(verdad)
-    print(prnt)
-
-
-    # Smaller filter size error examlpe
-    # arr = blosc2.asarray(np.array([True, False, True, False]))
-    # tableb2.filter(arr)
-
-    # Not same dtype error example
-    #tableb2.filter(exp_no_bool)
-
-    # Not NDArray error example
-    #tableb2.filter([True, False, True, False])
-
-    print('\n\n')
-
-
-    # The following expresions are equivalent
-
-    tableb2.row[:3]    # and other slice combinations such as 0:3, :3:1
-    filas = tableb2.row["1:3"]
-
-
-    print(tableb2["name"].dtype)
-
-
-    # Head and tail return a new table with the first and last n rows respectivley
-    tableb2.tail(5)
-    tableb2.head(5)
-
-
-
-
-    table_extension_fail = ColumnTable_B2(RowModel2, data_5, key="id")
-
-    # tableb2.extend(table_extension_fail)
-    tableb2.extend(tableb2.head(3))
-
-    tableb2.delete([1, 2, 3, 5, 7, 8])
-    tableb2.delete(0)
-
-    print(tableb2)
-
-
-
-    """ Esto no funciona """
-
-
-    '''target_name = blosc2.full(shape=(tableb2.nrows,), fill_value="unknown", dtype="<U32")
-
-    lzExp = (tableb2["name"] == "unknown")
-    cmptExp = lzExp.compute()'''
