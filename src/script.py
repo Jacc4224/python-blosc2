@@ -240,18 +240,18 @@ class _RowIndexer:
 
 class ColumnTable_B2(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None) -> None:
+    def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None, key: str = None) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
         self._capacity: int = 1
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
         self.row = _RowIndexer(self)
+        self._key: str = key
 
 
         for name, field in row_type.model_fields.items():
             origin = getattr(field.annotation, "__origin__", field.annotation)
-
 
             # We need to check for other posibilities...
             if origin == str or field.annotation == str:
@@ -353,12 +353,48 @@ class ColumnTable_B2(Generic[RowT]):
         retval = ColumnTable_B2(self._row_type, row_to_add)
         return retval
 
-
     def __getitem__(self, s: str):
         return self._cols[s] if s in self._cols else None
 
     def __getattr__(self, s: str):
         return self[s] if s in self._cols else super().__getattribute__(s)
+
+    def __setitem__(self, key, value):
+        if key not in self._cols.keys():
+            raise KeyError(f"Key {key} not in ColumnTable")
+
+        if key == self._key:
+            raise KeyError("Cannot modify column set as key")
+
+        if isinstance(value, blosc2.LazyExpr):
+            value = value.compute()
+        elif isinstance(value, np.ndarray):
+            value = blosc2.asarray(value)
+        elif not isinstance(value, blosc2.NDArray):
+            try:
+                value = blosc2.asarray(value)
+            except Exception as e:
+                raise TypeError(
+                    f"Could not turn value for '{key}' to a NDArray. "
+                    f"Accepted types: blosc2.NDArray, numpy.ndarray, blosc2.LazyExpr, lists. "
+                    f"Error: {e}"
+                )
+
+
+        if len(value) != self._n_rows:
+            raise ValueError(
+                f"Inconsistent length. Table has {self._nrows} rows, "
+                f"but column '{key}' has {value.shape[0]} rows."
+            )
+
+
+        if value.dtype != self._cols[key].dtype:
+            raise TypeError(
+                    f"Inconsistent dtype. The column '{key}' is of type {self._cols[key].dtype}., "
+                    f"but the new value is of type {value.dtype}."
+                )
+        # 3. Asignar al diccionario interno
+        self._cols[key] = value
 
     @property
     def nrows(self) -> int:
@@ -374,6 +410,12 @@ class ColumnTable_B2(Generic[RowT]):
             ) from e
 
         if self._n_rows > 0:
+            if self._key is not None:
+                key = data[self._key]
+                for v in self._cols[self._key]:
+                    if v == key:
+                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+
             self._capacity += 1
             for col_array in self._cols.values():
                 col_array.resize((self._capacity,))
@@ -383,6 +425,9 @@ class ColumnTable_B2(Generic[RowT]):
 
         self._n_rows += 1
 
+    def delete(self, data: dict[str, Any] | RowT) -> None:
+        ...
+
     def _appendExtend(self, data: dict[str, Any] | RowT) -> None:
         try:
             row = data if isinstance(data, self._row_type) else self._row_type(**data)
@@ -391,6 +436,17 @@ class ColumnTable_B2(Generic[RowT]):
                 f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
                 f"Details: {e}"
             ) from e
+
+        if self._n_rows > 0:
+            if self._key is not None:
+                key = data[self._key]
+                for v in self._cols[self._key]:
+                    if v == key:
+                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+
+        # if error the table should be resized, otherwise empty or default rows.
+        # continue with extend and resize one row?
+        # stop extend and rsize all empty rows?
 
         for k, v in row.model_dump().items():
             self._cols[k][self._n_rows] = v
@@ -481,6 +537,11 @@ class ColumnTable_B2(Generic[RowT]):
         f"but got '{type(ind).__name__}'."
         )
 
+
+
+
+    """Save y load por revisar: ha habido cambios como _key"""
+
     def save(self, urlpath: str, group: str = "table") -> None:
         """
         Persist columns into a single TreeStore container.
@@ -570,17 +631,17 @@ if __name__ == "__main__":
     #Capacity atribute set al 512 by default
 
 
-    datos_1 = {"id": 0, "name": "Alice", "score": 91.5}
-    datos_2 = [
+    data_1 = {"id": 0, "name": "Alice", "score": 91.5}
+    data_2 = [
             {"id": 1, "name": "bob", "score": 88.0, "active": False},
-            {"id": 3, "score": 88.0, "active": False},  # missing field
-            {"id": 2, "name": "carol", "score": 73.25},
+            {"id": 2, "score": 88.0, "active": False},  # missing field
+            {"id": 3, "name": "carol", "score": 73.25},
             {"id": 4, "name": "Alex", "score": 3.0, "active": True},
 
             ]
-    datos_3 = {"id": 5, "name": "Jorge", "score": 42.0}
+    data_3 = {"id": 4, "name": "Jorge", "score": 42.0}
 
-    datos_4 = [{"id": 0, "name": "Alice", "score": 91.5},
+    data_4 = [{"id": 0, "name": "Alice", "score": 91.5},
                  {"id": 1, "name": "Bob", "score": 88.0, "active": False},
                  {"id": 2, "score": 88.0, "active": False},
                  {"id": 3, "name": "Carol", "score": 73.25},
@@ -633,14 +694,15 @@ if __name__ == "__main__":
                 ]
 
 
-    # Lets try indexing  new elements
-    tableb2 = ColumnTable_B2(RowModel, datos_1)
-    tableb2.extend(datos_2)
-    tableb2.append(datos_3)
+    # Lets try indexing  new elements with key="id"
+    tableb2 = ColumnTable_B2(RowModel, data_1, key="id")
+    tableb2.extend(data_2)
+    # tableb2.append(data_3) # key="id" in data_3 is the same as in data_i: KeyError
 
 
 
-    tableb2 = ColumnTable_B2(RowModel, datos_4)
+    tableb2 = ColumnTable_B2(RowModel, data_4)
+
 
 
     # Append error example
@@ -688,9 +750,6 @@ if __name__ == "__main__":
     # The following expresions are equivalent
 
     tableb2.row[:3]    # and other slice combinations such as 0:3, :3:1
-
-
-
     filas = tableb2.row["1:3"]
     print(filas)
 
@@ -703,6 +762,9 @@ if __name__ == "__main__":
     # Head and tail return a new table with the first and last n rows respectivley
     tableb2.head(5)
     tableb2.tail(5)
+
+
+    print(tableb2)
 
 
     """ Esto no funciona
