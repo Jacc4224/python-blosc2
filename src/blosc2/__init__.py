@@ -607,6 +607,10 @@ from .ndarray import (
     where,
 )
 
+
+from blosc2.ctable import CTable
+
+
 __all__ = [  # noqa : RUF022
     # Constants
     "EXTENDED_HEADER_LENGTH",
