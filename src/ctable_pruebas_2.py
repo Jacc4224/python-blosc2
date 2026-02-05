@@ -499,8 +499,10 @@ class CTable(Generic[RowT]):
         for i, name in enumerate(current_col_names):
             target_array = self._cols[name]
             source_array = processed_cols[i]
-
+            print(self._cols[name].dtype)
+            print(source_array.dtype)
             self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
+            print(f"He entrado {i} vez/ces")
             #target_array.resize((self._capacity,))
             #target_array[old_nrows:self._n_rows] = source_array[:]
 
@@ -666,9 +668,8 @@ class CTable(Generic[RowT]):
 
 
 if __name__ == "__main__":
+
     dt = np.dtype([('id', 'i8'), ('name', 'U10'), ('score', 'f8'), ('active', '?')])
-
-
 
     data_1 = [
         [101, "Alice", 85.5, True],
@@ -695,10 +696,11 @@ if __name__ == "__main__":
     ], dtype=dt)
     data_4 = [row for row in _temp_arr]
 
-    data_5 = CTable(RowModel, new_data=[
+
+    '''data_5 = CTable(RowModel, new_data=[
         [401, "Mike", 55.0, True],
         [402, "Nina", 89.0, True]
-    ])
+    ])'''
 
     data_6 = (
         (501, "Oscar", 45.0, False),
@@ -720,8 +722,8 @@ if __name__ == "__main__":
         (802, "Walter", 44.4, False)  # Tupla
     ]
 
-    print("Generando 100,000 filas de prueba...")
-    n_rows = 100_000
+    print("Generando 1,000,000 filas de prueba...")
+    n_rows = 1_000_000
 
     # Generamos una lista de listas (formato fila) compatible con tu extend actual
     data_masiva = []
@@ -733,19 +735,20 @@ if __name__ == "__main__":
             i % 2 == 0
         ])
 
+
     # Instanciamos la tabla vacía
     tabla_test = CTable(RowModel)
     tabla_test.extend(data_masiva)
 
-    tabla_test_2= CTable(RowModel)
+    tabla_test_2 = CTable(RowModel)
     tabla_test_2.extend(data_masiva)
+
 
 
     print("Comenzando prueba de rendimiento 1...")
 
     inicio = time.perf_counter()
 
-    tabla_test.extend(tabla_test_2)
 
     fin = time.perf_counter()
 
