@@ -5,16 +5,23 @@
 # This source code is licensed under a BSD-style license (found in the
 # LICENSE file in the root directory of this source tree)
 #######################################################################
+
+"""Imports para CTable"""
+
 from __future__ import annotations
 from collections.abc import Iterable
 
 from dataclasses import Field
-from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
+from blosc2 import concat
+
+""" Imports extra """
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -58,17 +65,20 @@ class _RowIndexer:
 
 class CTable(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None, key: str = None) -> None:
+    def __init__(self, row_type: type[RowT], new_data = None, key: str = None) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
         self._capacity: int = 1
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
+        self._col_names = []
         self.row = _RowIndexer(self)
         self._key: str = key
+        self._key_set: set[Any] = set()
 
 
         for name, field in row_type.model_fields.items():
+            self._col_names.append(name)
             origin = getattr(field.annotation, "__origin__", field.annotation)
 
             # We need to check for other posibilities...
@@ -117,10 +127,23 @@ class CTable(Generic[RowT]):
             self._cols[name] = blosc2.zeros(shape=1, dtype=dt)
 
         if new_data is not None:
-            if isinstance(new_data, Iterable) and not isinstance(new_data, dict):
-                self.extend(new_data)
-            else:
+            is_append = False
+
+            if isinstance(new_data, (np.void, np.record)):
+                is_append = True
+            elif isinstance(new_data, np.ndarray):
+                if new_data.dtype.names is not None and new_data.ndim == 0:
+                    is_append = True
+            elif isinstance(new_data, list) and len(new_data) > 0:
+                first_elem = new_data[0]
+                if isinstance(first_elem, (str, bytes, int, float, bool, complex)):
+                    is_append = True
+
+            if is_append:
                 self.append(new_data)
+            else:
+                self.extend(new_data)
+
 
     def __str__(self):
         retval = []
@@ -177,6 +200,8 @@ class CTable(Generic[RowT]):
     def __getattr__(self, s: str):
         return self[s] if s in self._cols else super().__getattribute__(s)
 
+
+    # Revisar
     def __setitem__(self, key, value):
         if key not in self._cols.keys():
             raise KeyError(f"Key {key} not in ColumnTable")
@@ -241,28 +266,69 @@ class CTable(Generic[RowT]):
         """
         ...
 
-    def append(self, data: dict[str, Any] | RowT) -> None:
-        try:
-            row = data if isinstance(data, self._row_type) else self._row_type(**data)
-        except (TypeError, ValidationError) as e:
-            raise TypeError(
-                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
-                f"Details: {e}"
-            ) from e
+    def append(self, data: list | np.void | np.ndarray) -> None:
+        is_list = isinstance(data, (list, tuple))
+        key_value = None
+        col_values = list(self._cols.values())
+        col_names = self._col_names
 
-        if self._n_rows > 0:
-            if self._key is not None:
-                key = data[self._key]
-                if key in self._key_set:
-                    raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
-                self._key_set.add(key)
+        if isinstance(data, dict):
+            raise TypeError("Dictionaries are not supported in append.")
 
-            self._capacity += 1
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+        if is_list and len(data) != len(col_values):
+            raise ValueError(f"Expected {len(col_values)} values, received {len(data)}")
 
-        for k, v in row.model_dump().items():
-            self._cols[k][self._n_rows] = v
+        if self._key is not None:
+            if is_list:
+                try:
+                    key_idx = col_names.index(self._key)
+                    key_value = data[key_idx]
+                except ValueError:
+                    raise KeyError(f"Key column '{self._key}' does not exist.")
+            else:
+                try:
+                    key_value = data[self._key]
+                except (IndexError, KeyError, ValueError):
+                    raise KeyError(f"Input data does not contain the key field '{self._key}'")
+
+            if key_value in self._key_set:
+                raise KeyError(f"Key '{key_value}' already exists in column '{self._key}'")
+
+        if is_list:
+            for i, val in enumerate(data):
+                target_dtype = col_values[i].dtype
+                try:
+                    np.array(val, dtype=target_dtype)
+                except (ValueError, TypeError):
+                    raise TypeError(
+                        f"Value '{val}' is not compatible with column '{col_names[i]}' of type {target_dtype}")
+        else:
+            for name, arr in self._cols.items():
+                try:
+                    val = data[name]
+                except (IndexError, KeyError, ValueError):
+                    raise ValueError(f"Input data does not contain required field '{name}'")
+
+                try:
+                    np.array(val, dtype=arr.dtype)
+                except (ValueError, TypeError):
+                    raise TypeError(f"Value '{val}' in field '{name}' is not compatible with type {arr.dtype}")
+
+        self._capacity += 1
+        for col_array in col_values:
+            col_array.resize((self._capacity,))
+
+
+        if is_list:
+            for i, col_array in enumerate(col_values):
+                col_array[self._n_rows] = data[i]
+        else:
+            for name, col_array in self._cols.items():
+                col_array[self._n_rows] = data[name]
+
+
+        if self._key is not None:
+            self._key_set.add(key_value)
 
         self._n_rows += 1
 
@@ -297,57 +363,74 @@ class CTable(Generic[RowT]):
         else:
             raise TypeError("Position must be an integer or a list of integers")
 
-    def _appendExtend(self, data: dict[str, Any] | RowT) -> None:
-        try:
-            row = data if isinstance(data, self._row_type) else self._row_type(**data)
-        except (TypeError, ValidationError) as e:
-            raise TypeError(
-                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
-                f"Details: {e}"
-            ) from e
+    def extend(self, data: list | CTable | Any) -> None:
+        if isinstance(data, dict):
+            raise TypeError("Dictionaries are not supported in extend.")
 
-        if self._n_rows > 0:
-            if self._key is not None:
-                key = data[self._key]
-                for v in self._cols[self._key]:
-                    if v == key:
-                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+        current_col_names = getattr(self, "_col_names", list(self._cols.keys()))
+        current_col_values = [self._cols[name] for name in current_col_names]
 
-        # if error the table should be resized, otherwise empty or default rows.
-        # continue with extend and resize one row?
-        # stop extend and rsize all empty rows?
+        new_b2_cols = []
+        new_nrows = 0
 
-        for k, v in row.model_dump().items():
-            self._cols[k][self._n_rows] = v
+        if hasattr(data, "_cols") and hasattr(data, "nrows"):
+            if len(data._cols) != len(current_col_names):
+                raise ValueError(f"Input CTable has {len(data._cols)} columns, expected {len(current_col_names)}")
 
-        self._n_rows += 1
+            for name in current_col_names:
+                if name not in data._cols:
+                    raise ValueError(f"Input CTable missing column '{name}'")
+                new_b2_cols.append(data._cols[name])
 
-    def extend(self, rows: Iterable[dict[str, Any] | RowT] | CTable) -> None:
-        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, CTable)):
-            raise TypeError("Expected an iterable of rows or blosc2.CTable.")
-        if isinstance(rows, CTable):
-            if rows._row_type != self._row_type:
-                raise TypeError("Tables are not the same type.")
+            new_nrows = data.nrows
 
-            self._capacity = self._capacity + rows.nrows
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+        elif isinstance(data, (list, tuple)):
+            if len(data) != len(current_col_names):
+                raise ValueError(f"Expected {len(current_col_names)} columns, received {len(data)}")
 
-            for k in rows._cols.keys():
-                self._cols[k][self._n_rows:] = rows._cols[k][:]
-            self._n_rows += rows.nrows
+            for i, col_data in enumerate(data):
+                target_dtype = current_col_values[i].dtype
+                try:
+                    b2_arr = blosc2.asarray(col_data, dtype=target_dtype)
+                except Exception as e:
+                    raise TypeError(f"Column {i} ('{current_col_names[i]}') conversion error: {e}")
 
+                if i == 0:
+                    new_nrows = b2_arr.shape[0]
+                elif b2_arr.shape[0] != new_nrows:
+                    raise ValueError("All new columns must have the same length.")
+
+                new_b2_cols.append(b2_arr)
         else:
-            if self._n_rows > 0:
-                self._capacity += len(rows)
-            else:
-                self._capacity += len(rows)-1
+            raise TypeError("Data format not supported in extend (expected list of columns or CTable).")
 
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+        if new_nrows == 0:
+            return
 
-            for r in rows:
-                self._appendExtend(r)
+        if self._key is not None:
+            key_idx = current_col_names.index(self._key)
+            new_key_col = new_b2_cols[key_idx]
+            new_keys_np = new_key_col[:]
+
+            if len(set(new_keys_np)) != len(new_keys_np):
+                raise KeyError(f"Input data contains duplicate keys in column '{self._key}'")
+
+            if not self._key_set.isdisjoint(new_keys_np):
+                raise KeyError(f"Input data contains keys that already exist in the table.")
+
+        old_nrows = self._n_rows
+        self._n_rows += new_nrows
+        self._capacity = self._n_rows
+
+        for i, name in enumerate(current_col_names):
+            target_array = self._cols[name]
+            source_array = new_b2_cols[i]
+
+            target_array.resize((self._capacity,))
+            target_array[old_nrows:self._n_rows] = source_array[:]
+
+        if self._key is not None:
+            self._key_set.update(new_keys_np)
 
     def filter(self, expr_result) -> CTable:
         filtro = None
@@ -375,7 +458,6 @@ class CTable(Generic[RowT]):
         return retval
 
     def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
-
         if isinstance(ind, str):
             try:
                 parts = [p.strip() for p in ind.split(':')]
@@ -505,3 +587,6 @@ class CTable(Generic[RowT]):
             tbl._capacity = loaded_nrows
             return tbl
 
+
+if __name__ == "__main__":
+    ...

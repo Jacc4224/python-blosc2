@@ -5,6 +5,9 @@
 # This source code is licensed under a BSD-style license (found in the
 # LICENSE file in the root directory of this source tree)
 #######################################################################
+
+"""Imports para CTable"""
+
 from __future__ import annotations
 from collections.abc import Iterable
 
@@ -15,6 +18,10 @@ import numpy as np
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
+from blosc2 import concat
+
+""" Imports extra """
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -66,6 +73,7 @@ class CTable(Generic[RowT]):
         self._col_widths: dict[str, int] = {}
         self.row = _RowIndexer(self)
         self._key: str = key
+        self._key_set: set[Any] = set()
 
 
         for name, field in row_type.model_fields.items():
@@ -241,6 +249,9 @@ class CTable(Generic[RowT]):
         """
         ...
 
+
+
+    # La mejor forma de optimizar lo siguiente es con C. Muchas iteraciones en python
     def append(self, data: dict[str, Any] | RowT) -> None:
         try:
             row = data if isinstance(data, self._row_type) else self._row_type(**data)
@@ -253,9 +264,9 @@ class CTable(Generic[RowT]):
         if self._n_rows > 0:
             if self._key is not None:
                 key = data[self._key]
-                for v in self._cols[self._key]:
-                    if v == key:
-                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+                if key in self._key_set:
+                    raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+                self._key_set.add(key)
 
             self._capacity += 1
             for col_array in self._cols.values():
@@ -309,9 +320,9 @@ class CTable(Generic[RowT]):
         if self._n_rows > 0:
             if self._key is not None:
                 key = data[self._key]
-                for v in self._cols[self._key]:
-                    if v == key:
-                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+                if key in self._key_set:
+                    raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+                self._key_set.add(key)
 
         # if error the table should be resized, otherwise empty or default rows.
         # continue with extend and resize one row?
@@ -323,31 +334,7 @@ class CTable(Generic[RowT]):
         self._n_rows += 1
 
     def extend(self, rows: Iterable[dict[str, Any] | RowT] | CTable) -> None:
-        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, CTable)):
-            raise TypeError("Expected an iterable of rows or blosc2.CTable.")
-        if isinstance(rows, CTable):
-            if rows._row_type != self._row_type:
-                raise TypeError("Tables are not the same type.")
-
-            self._capacity = self._capacity + rows.nrows
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-
-            for k in rows._cols.keys():
-                self._cols[k][self._n_rows:] = rows._cols[k][:]
-            self._n_rows += rows.nrows
-
-        else:
-            if self._n_rows > 0:
-                self._capacity += len(rows)
-            else:
-                self._capacity += len(rows)-1
-
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-
-            for r in rows:
-                self._appendExtend(r)
+        ...
 
     def filter(self, expr_result) -> CTable:
         filtro = None
@@ -375,7 +362,6 @@ class CTable(Generic[RowT]):
         return retval
 
     def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
-
         if isinstance(ind, str):
             try:
                 parts = [p.strip() for p in ind.split(':')]
@@ -597,10 +583,10 @@ if __name__ == "__main__":
 
     ##############################################################################
     # Save (using treestore)
-    tableb2.save(urlpath="people.b2z")
+    # tableb2.save(urlpath="people.b2z")
 
     # Load back
-    loaded = CTable.load(urlpath="people.b2z")
+    # loaded = CTable.load(urlpath="people.b2z")
 
     """
         The Columns are shuffled, not the same order as before save
@@ -667,3 +653,13 @@ if __name__ == "__main__":
 
     lzExp = (tableb2["name"] == "unknown")
     cmptExp = lzExp.compute()'''
+    ids = []
+    names = []
+    scores = []
+
+    data_dict_cols = {
+        "id": np.array(ids, dtype=np.int64),
+        "name": np.array(names, dtype='U10'),  # String de longitud fija ayuda
+        "score": np.array(scores, dtype=np.float64)
+    }
+    ctable = CTable(row_type=data_dict_cols)
