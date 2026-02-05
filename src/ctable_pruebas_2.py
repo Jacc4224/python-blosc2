@@ -12,16 +12,19 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from dataclasses import Field
+from email.policy import strict
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
+from algoritmia.schemes.dac_scheme import tail_dec_solve
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
 from blosc2 import concat
 
 """ Imports extra """
-
+import time
+import random
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -170,29 +173,56 @@ class CTable(Generic[RowT]):
             retval.append("\n")
         return "".join(retval)
 
-    def head(self, head: int = 1) -> None:
-        if not isinstance(head, int):
-            raise TypeError("tail must be an integer")
+    def head(self, n: int = 5) -> CTable:
+        if not isinstance(n, int):
+            raise TypeError("n must be an integer")
 
         start = 0
-        end = min(self._n_rows, head)
+        end = min(n, self._n_rows)
 
-        row_to_add = self.row[start:end]
+        if n <= 0:
+            return self.__class__(self._row_type)
 
-        retval = CTable(self._row_type, row_to_add)
-        return retval
+        new_table = self.__class__(self._row_type)
+        col_names = getattr(self, "_col_names", list(self._cols.keys()))
 
-    def tail(self, tail: int = 1) -> None:
-        if not isinstance(tail, int):
-            raise TypeError("tail must be an integer")
+        count = end - start
+        new_table._n_rows = count
+        new_table._capacity = count
 
+        for name in col_names:
+            source_slice = self._cols[name][start:end]
+            new_table._cols[name].resize((count,))
+            new_table._cols[name][:] = source_slice
+
+        if self._key is not None:
+            new_table._key = self._key
+            keys_slice = self._cols[self._key][start:end]
+            new_table._key_set = set(keys_slice)
+
+        return new_table
+
+    def tail(self, n: int = 5) -> CTable:
+        if not isinstance(n, int):
+            raise TypeError("n must be an integer")
+        start = max(0, self._n_rows - n)
         end = self._n_rows
-        start = max(0, self._n_rows-tail)
-
-        row_to_add = self.row[start:end]
-
-        retval = CTable(self._row_type, row_to_add)
-        return retval
+        if n <= 0:
+            return self.__class__(self._row_type)
+        new_table = self.__class__(self._row_type)
+        col_names = getattr(self, "_col_names", list(self._cols.keys()))
+        count = end - start
+        new_table._n_rows = count
+        new_table._capacity = count
+        for name in col_names:
+            source_slice = self._cols[name][start:end]
+            new_table._cols[name].resize((count,))
+            new_table._cols[name][:] = source_slice
+        if self._key is not None:
+            new_table._key = self._key
+            keys_slice = self._cols[self._key][start:end]
+            new_table._key_set = set(keys_slice)
+        return new_table
 
     def __getitem__(self, s: str):
         return self._cols[s] if s in self._cols else None
@@ -370,7 +400,7 @@ class CTable(Generic[RowT]):
         current_col_names = getattr(self, "_col_names", list(self._cols.keys()))
         current_col_values = [self._cols[name] for name in current_col_names]
 
-        new_b2_cols = []
+        columns_to_insert = []
         new_nrows = 0
 
         if hasattr(data, "_cols") and hasattr(data, "nrows"):
@@ -380,37 +410,81 @@ class CTable(Generic[RowT]):
             for name in current_col_names:
                 if name not in data._cols:
                     raise ValueError(f"Input CTable missing column '{name}'")
-                new_b2_cols.append(data._cols[name])
+
+                if data._cols[name].dtype != self._cols[name].dtype:
+                    raise TypeError(
+                        f"Column '{name}' dtype mismatch. Source: {data._cols[name].dtype}, Target: {self._cols[name].dtype}")
+
+                columns_to_insert.append(data._cols[name])
 
             new_nrows = data.nrows
 
-        elif isinstance(data, (list, tuple)):
-            if len(data) != len(current_col_names):
-                raise ValueError(f"Expected {len(current_col_names)} columns, received {len(data)}")
 
-            for i, col_data in enumerate(data):
-                target_dtype = current_col_values[i].dtype
+        elif isinstance(data, (list, tuple, np.ndarray)):
+            if len(data) == 0:
+                return
+            first_row = data[0]
+
+            if hasattr(first_row, "dtype") and getattr(first_row.dtype, "names", None):
                 try:
-                    b2_arr = blosc2.asarray(col_data, dtype=target_dtype)
-                except Exception as e:
-                    raise TypeError(f"Column {i} ('{current_col_names[i]}') conversion error: {e}")
+                    structured_source = np.asarray(data) if not isinstance(data, np.ndarray) else data
+                except Exception:
+                    structured_source = data
+                columns_to_insert = []
 
-                if i == 0:
-                    new_nrows = b2_arr.shape[0]
-                elif b2_arr.shape[0] != new_nrows:
-                    raise ValueError("All new columns must have the same length.")
+                for name in current_col_names:
+                    try:
+                        if isinstance(structured_source, np.ndarray) and structured_source.dtype.names:
+                            col_values = structured_source[name]
+                        else:
+                            col_values = [row[name] for row in data]
+                    except (ValueError, IndexError, KeyError):
+                        raise ValueError(f"Input row matches structured type but is missing required field '{name}'")
+                    columns_to_insert.append(col_values)
 
-                new_b2_cols.append(b2_arr)
+                new_nrows = len(data)
+
+            else:
+                if len(first_row) != len(current_col_names):
+                    raise ValueError(
+                        f"Rows must have {len(current_col_names)} items, but first row has {len(first_row)}")
+
+                try:
+                    columns_to_insert = list(zip(*data, strict=True))
+                except TypeError:
+                    columns_to_insert = list(zip(*data))
+                except ValueError:
+                    raise ValueError("Inconsistent row lengths in input data.")
+                except Exception:
+                    raise ValueError("Error transposing data. Ensure all rows are iterable.")
+
+                if len(columns_to_insert) != len(current_col_names):
+                    raise ValueError(f"Data has {len(columns_to_insert)} columns, expected {len(current_col_names)}.")
+
+                new_nrows = len(data)
+
         else:
-            raise TypeError("Data format not supported in extend (expected list of columns or CTable).")
+            raise TypeError("Data format not supported in extend.")
 
         if new_nrows == 0:
             return
 
+        processed_cols = []
+        for i, raw_col in enumerate(columns_to_insert):
+            target_dtype = current_col_values[i].dtype
+            try:
+                if isinstance(raw_col, blosc2.NDArray) and raw_col.dtype == target_dtype:
+                    b2_arr = raw_col
+                else:
+                    b2_arr = blosc2.asarray(raw_col, dtype=target_dtype)
+
+                processed_cols.append(b2_arr)
+            except Exception as e:
+                raise TypeError(f"Column {i} ('{current_col_names[i]}') conversion error: {e}")
+
         if self._key is not None:
             key_idx = current_col_names.index(self._key)
-            new_key_col = new_b2_cols[key_idx]
-            new_keys_np = new_key_col[:]
+            new_keys_np = processed_cols[key_idx][:]
 
             if len(set(new_keys_np)) != len(new_keys_np):
                 raise KeyError(f"Input data contains duplicate keys in column '{self._key}'")
@@ -424,10 +498,11 @@ class CTable(Generic[RowT]):
 
         for i, name in enumerate(current_col_names):
             target_array = self._cols[name]
-            source_array = new_b2_cols[i]
+            source_array = processed_cols[i]
 
-            target_array.resize((self._capacity,))
-            target_array[old_nrows:self._n_rows] = source_array[:]
+            self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
+            #target_array.resize((self._capacity,))
+            #target_array[old_nrows:self._n_rows] = source_array[:]
 
         if self._key is not None:
             self._key_set.update(new_keys_np)
@@ -499,7 +574,6 @@ class CTable(Generic[RowT]):
         f"Invalid argument type. Expected 'int' or 'slice', "
         f"but got '{type(ind).__name__}'."
         )
-
 
 
 
@@ -588,5 +662,148 @@ class CTable(Generic[RowT]):
             return tbl
 
 
+
+
+
 if __name__ == "__main__":
-    ...
+    dt = np.dtype([('id', 'i8'), ('name', 'U10'), ('score', 'f8'), ('active', '?')])
+
+
+
+    data_1 = [
+        [101, "Alice", 85.5, True],
+        [102, "Bob", 92.0, False],
+        [103, "Charlie", 78.5, True]
+    ]
+
+    data_2 = [
+        [104, "David", 60.0, False]
+    ]
+
+    data_3 = np.array([
+        (201, "Eve", 88.5, True),
+        (202, "Frank", 90.0, True),
+        (203, "Grace", 75.0, False),
+        (204, "Heidi", 95.5, True),
+        (205, "Ivan", 80.0, False)
+    ], dtype=dt)
+
+    _temp_arr = np.array([
+        (301, "Judy", 99.9, True),
+        (302, "Kevin", 15.5, False),
+        (303, "Laura", 67.0, True)
+    ], dtype=dt)
+    data_4 = [row for row in _temp_arr]
+
+    data_5 = CTable(RowModel, new_data=[
+        [401, "Mike", 55.0, True],
+        [402, "Nina", 89.0, True]
+    ])
+
+    data_6 = (
+        (501, "Oscar", 45.0, False),
+        (502, "Pam", 91.0, True),
+        (503, "Quinn", 82.5, False),
+        (504, "Rose", 77.0, True)
+    )
+
+    data_7 = []
+    for i in range(20):
+        data_7.append([600 + i, f"User_{i}", 50.0 + i, i % 2 == 0])
+
+    data_8 = np.array([(700, "Zoro", 10.0, True)], dtype=dt)[0]  # np.void
+
+    data_9 = [np.array([(701, "Yara", 20.0, False)], dtype=dt)[0]]
+
+    data_10 = [
+        [801, "Xavier", 33.3, True],  # Lista
+        (802, "Walter", 44.4, False)  # Tupla
+    ]
+
+    print("Generando 100,000 filas de prueba...")
+    n_rows = 100_000
+
+    # Generamos una lista de listas (formato fila) compatible con tu extend actual
+    data_masiva = []
+    for i in range(n_rows):
+        data_masiva.append([
+            i,
+            f"User_{i}",
+            random.random() * 100,
+            i % 2 == 0
+        ])
+
+    # Instanciamos la tabla vacía
+    tabla_test = CTable(RowModel)
+    tabla_test.extend(data_masiva)
+
+    tabla_test_2= CTable(RowModel)
+    tabla_test_2.extend(data_masiva)
+
+
+    print("Comenzando prueba de rendimiento 1...")
+
+    inicio = time.perf_counter()
+
+    tabla_test.extend(tabla_test_2)
+
+    fin = time.perf_counter()
+
+    tiempo_total = fin - inicio
+    velocidad = n_rows / tiempo_total
+
+    print(f"\n=== RESULTADOS ===")
+    print(f"Filas insertadas: {n_rows:,}")
+    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
+    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
+    print(tabla_test.tail(5))
+
+    print("Comenzando prueba de rendimiento 2...")
+    tabla_test = CTable(RowModel)
+
+    inicio = time.perf_counter()
+
+    tabla_test.extend(data_masiva)
+
+    fin = time.perf_counter()
+
+    tiempo_total = fin - inicio
+    velocidad = n_rows / tiempo_total
+
+    print(f"\n=== RESULTADOS ===")
+    print(f"Filas insertadas: {n_rows:,}")
+    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
+    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
+    print(tabla_test.tail(5))
+
+
+
+    dtype = np.dtype([
+        ("id", "i8"),
+        ("name", "U32"),  # ajusta el 32 si tus strings pueden ser más largos
+        ("score", "f8"),
+        ("active", "?"),
+    ])
+
+    data_masiva = []
+    for i in range(n_rows):
+        # Opción 1 (muy explícita): crear 1 elemento y coger el escalar estructurado (np.void)
+        rec = np.array([(i, f"User_{i}", random.random() * 100, (i % 2 == 0))], dtype=dtype)[0]
+        data_masiva.append(rec)
+    print("Comenzando prueba de rendimiento 3...")
+    tabla_test = CTable(RowModel)
+
+    inicio = time.perf_counter()
+
+    tabla_test.extend(data_masiva)
+
+    fin = time.perf_counter()
+
+    tiempo_total = fin - inicio
+    velocidad = n_rows / tiempo_total
+
+    print(f"\n=== RESULTADOS ===")
+    print(f"Filas insertadas: {n_rows:,}")
+    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
+    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
+    print(tabla_test.tail(5))
