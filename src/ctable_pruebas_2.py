@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
 from algoritmia.schemes.dac_scheme import tail_dec_solve
+from numpy.ma.core import append
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
@@ -25,6 +26,9 @@ from blosc2 import concat
 """ Imports extra """
 import time
 import random
+
+import pandas as pd
+from typing import Annotated
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -43,11 +47,17 @@ class MaxLen:
 
 
 class RowModel(BaseModel):
+    id: Annotated[int, NumpyDtype(np.int64)] = Field(ge=0)
+    c_val: Annotated[complex, NumpyDtype(np.complex128)] = Field(default=0j)
+    score: Annotated[float, NumpyDtype(np.float64)] = Field(ge=0, le=100)
+    active: Annotated[bool, NumpyDtype(np.bool_)] = True
+
+'''class RowModel(BaseModel):
     id: Annotated[int, NumpyDtype(np.int16)] = Field(ge=0)
     name: Annotated[str, MaxLen(10)] = Field(default="unknown")
     # name: Annotated[bytes, MaxLen(10)] = Field(default=b"unknown")
     score: Annotated[float, NumpyDtype(np.float32)] = Field(ge=0, le=100)
-    active: Annotated[bool, NumpyDtype(np.bool_)] = True
+    active: Annotated[bool, NumpyDtype(np.bool_)] = True'''
 
 class RowModel2(BaseModel):
     id: Annotated[int, NumpyDtype(np.int16)] = Field(ge=0)
@@ -173,6 +183,9 @@ class CTable(Generic[RowT]):
             retval.append("\n")
         return "".join(retval)
 
+    def __len__(self):
+        return self._n_rows
+
     def head(self, n: int = 5) -> CTable:
         if not isinstance(n, int):
             raise TypeError("n must be an integer")
@@ -228,7 +241,7 @@ class CTable(Generic[RowT]):
         return self._cols[s] if s in self._cols else None
 
     def __getattr__(self, s: str):
-        return self[s] if s in self._cols else super().__getattribute__(s)
+        return self._cols[s] if s in self._cols else super().__getattribute__(s)
 
 
     # Revisar
@@ -372,10 +385,13 @@ class CTable(Generic[RowT]):
                     while(i+desp in pos):
                         desp += 1
                     v[i] = v[i + desp]
+
             self._capacity = self._capacity - len(pos)
+
             for col_array in self._cols.values():
                 col_array.resize((self._capacity,))
             self._n_rows = self._n_rows - len(pos)
+
         elif isinstance(pos, int):
             if pos > self._n_rows:
                 raise IndexError("Index out of range")
@@ -499,10 +515,8 @@ class CTable(Generic[RowT]):
         for i, name in enumerate(current_col_names):
             target_array = self._cols[name]
             source_array = processed_cols[i]
-            print(self._cols[name].dtype)
-            print(source_array.dtype)
             self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
-            print(f"He entrado {i} vez/ces")
+
             #target_array.resize((self._capacity,))
             #target_array[old_nrows:self._n_rows] = source_array[:]
 
@@ -521,17 +535,20 @@ class CTable(Generic[RowT]):
             filtro = expr_result.compute()
         elif isinstance(expr_result, blosc2.NDArray) or (expr_result.dtype != np.bool_):
             filtro = expr_result
-
+        filtro = filtro[:]
 
         retval = CTable(self._row_type)
+        n_true = np.count_nonzero(filtro)
+        retval._n_rows = n_true
+        retval._capacity = n_true
         if filtro is not None and len(filtro) >= self._n_rows:
-            for i in range(self._n_rows):
-                if filtro[i]:
-                    retval.append(self.row[i])
+            for k in self._cols.keys():
+                retval._cols[k] = self._cols[k][filtro]
         else:
             raise ValueError(
                 f"Filter length ({len(filtro)}) does not match the number of rows ({self._n_rows})."
             )
+
         return retval
 
     def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
@@ -668,73 +685,82 @@ class CTable(Generic[RowT]):
 
 
 if __name__ == "__main__":
+    import numpy as np
+    import time
+    import random
 
-    dt = np.dtype([('id', 'i8'), ('name', 'U10'), ('score', 'f8'), ('active', '?')])
+    # Definimos el dtype: cambiamos 'name' (U10) por 'c_val' (complex128 -> 'c16')
+    dt = np.dtype([('id', 'i8'), ('c_val', 'c16'), ('score', 'f8'), ('active', '?')])
+
+    # Ajustamos los datos para incluir números complejos en la segunda posición
 
     data_1 = [
-        [101, "Alice", 85.5, True],
-        [102, "Bob", 92.0, False],
-        [103, "Charlie", 78.5, True]
+        [101, 10.1 + 1.1j, 85.5, True],
+        [102, 20.2 + 2.2j, 92.0, False],
+        [103, 30.3 + 3.3j, 78.5, True]
     ]
 
     data_2 = [
-        [104, "David", 60.0, False]
+        [104, 40.4 + 4.4j, 60.0, False]
     ]
 
     data_3 = np.array([
-        (201, "Eve", 88.5, True),
-        (202, "Frank", 90.0, True),
-        (203, "Grace", 75.0, False),
-        (204, "Heidi", 95.5, True),
-        (205, "Ivan", 80.0, False)
+        (201, 5.5 + 0.5j, 88.5, True),
+        (202, 6.6 + 1.6j, 90.0, True),
+        (203, 7.7 + 2.7j, 75.0, False),
+        (204, 8.8 + 3.8j, 95.5, True),
+        (205, 9.9 + 4.9j, 80.0, False)
     ], dtype=dt)
 
     _temp_arr = np.array([
-        (301, "Judy", 99.9, True),
-        (302, "Kevin", 15.5, False),
-        (303, "Laura", 67.0, True)
+        (301, 11.1 + 5.1j, 99.9, True),
+        (302, 12.2 + 6.2j, 15.5, False),
+        (303, 13.3 + 7.3j, 67.0, True)
     ], dtype=dt)
     data_4 = [row for row in _temp_arr]
 
-
     '''data_5 = CTable(RowModel, new_data=[
-        [401, "Mike", 55.0, True],
-        [402, "Nina", 89.0, True]
+        [401, 14.4 + 8.4j, 55.0, True],
+        [402, 15.5 + 9.5j, 89.0, True]
     ])'''
 
     data_6 = (
-        (501, "Oscar", 45.0, False),
-        (502, "Pam", 91.0, True),
-        (503, "Quinn", 82.5, False),
-        (504, "Rose", 77.0, True)
+        (501, 16.6 + 10.6j, 45.0, False),
+        (502, 17.7 + 11.7j, 91.0, True),
+        (503, 18.8 + 12.8j, 82.5, False),
+        (504, 19.9 + 13.9j, 77.0, True)
     )
 
     data_7 = []
     for i in range(20):
-        data_7.append([600 + i, f"User_{i}", 50.0 + i, i % 2 == 0])
+        # Generamos un complejo dinámico basado en i
+        data_7.append([600 + i, complex(i, i * 2.5), 50.0 + i, i % 2 == 0])
 
-    data_8 = np.array([(700, "Zoro", 10.0, True)], dtype=dt)[0]  # np.void
+    # np.void con complejo
+    data_8 = np.array([(700, 50 + 50j, 10.0, True)], dtype=dt)[0]
 
-    data_9 = [np.array([(701, "Yara", 20.0, False)], dtype=dt)[0]]
+    data_9 = [np.array([(701, 60 - 20j, 20.0, False)], dtype=dt)[0]]
 
     data_10 = [
-        [801, "Xavier", 33.3, True],  # Lista
-        (802, "Walter", 44.4, False)  # Tupla
+        [801, 100 + 0j, 33.3, True],  # Lista con complejo puro real
+        (802, 0 + 200j, 44.4, False)  # Tupla con complejo puro imaginario
     ]
 
-    print("Generando 1,000,000 filas de prueba...")
-    n_rows = 1_000_000
+    print("Generando 1,000,000 filas de prueba con complejos...")
+    n_rows = 100_000
 
-    # Generamos una lista de listas (formato fila) compatible con tu extend actual
+    # Generación masiva actualizada
     data_masiva = []
     for i in range(n_rows):
         data_masiva.append([
             i,
-            f"User_{i}",
+            complex(i, i * 0.1),  # Valor complejo en lugar del string f"User_{i}"
             random.random() * 100,
             i % 2 == 0
         ])
 
+    # Nota: Asegúrate de que RowModel esté actualizado para tener un campo complejo
+    # compatible (ej. c_val = Col(dtype=np.complex128) o similar)
 
     # Instanciamos la tabla vacía
     tabla_test = CTable(RowModel)
@@ -743,25 +769,44 @@ if __name__ == "__main__":
     tabla_test_2 = CTable(RowModel)
     tabla_test_2.extend(data_masiva)
 
-
-
     print("Comenzando prueba de rendimiento 1...")
 
     inicio = time.perf_counter()
 
+    tabla_test_2.extend(tabla_test)
 
     fin = time.perf_counter()
 
     tiempo_total = fin - inicio
-    velocidad = n_rows / tiempo_total
+    velocidad = n_rows / tiempo_total if tiempo_total > 0 else 0
 
     print(f"\n=== RESULTADOS ===")
     print(f"Filas insertadas: {n_rows:,}")
     print(f"Tiempo total:     {tiempo_total:.4f} segundos")
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
-    print(tabla_test.tail(5))
+    print(len(tabla_test_2))
 
-    print("Comenzando prueba de rendimiento 2...")
+    inicio = time.perf_counter()
+
+    tabla_test_2.delete(list(range(0, len(tabla_test_2), 4)))
+
+    fin = time.perf_counter()
+
+    tiempo_total = fin - inicio
+    velocidad = n_rows / tiempo_total if tiempo_total > 0 else 0
+
+    print(f"\n=== RESULTADOS ===")
+    print(f"Filas insertadas: {n_rows:,}")
+    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
+    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
+    print(len(tabla_test_2))
+
+
+
+
+
+
+    """print("Comenzando prueba de rendimiento 2...")
     tabla_test = CTable(RowModel)
 
     inicio = time.perf_counter()
@@ -779,20 +824,21 @@ if __name__ == "__main__":
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
     print(tabla_test.tail(5))
 
-
-
+    # Actualización del dtype explícito para la prueba 3
     dtype = np.dtype([
         ("id", "i8"),
-        ("name", "U32"),  # ajusta el 32 si tus strings pueden ser más largos
+        ("c_val", "c16"),  # Cambiado "name", "U32" -> "c_val", "c16" (complex128)
         ("score", "f8"),
         ("active", "?"),
     ])
 
     data_masiva = []
     for i in range(n_rows):
-        # Opción 1 (muy explícita): crear 1 elemento y coger el escalar estructurado (np.void)
-        rec = np.array([(i, f"User_{i}", random.random() * 100, (i % 2 == 0))], dtype=dtype)[0]
+        # Opción 1: crear 1 elemento y coger el escalar estructurado (np.void)
+        # Usamos complex(i, i*0.5) como ejemplo
+        rec = np.array([(i, complex(i, i * 0.5), random.random() * 100, (i % 2 == 0))], dtype=dtype)[0]
         data_masiva.append(rec)
+
     print("Comenzando prueba de rendimiento 3...")
     tabla_test = CTable(RowModel)
 
@@ -810,3 +856,130 @@ if __name__ == "__main__":
     print(f"Tiempo total:     {tiempo_total:.4f} segundos")
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
     print(tabla_test.tail(5))
+
+    print("Generando 1,000,000 filas de prueba con complejos...")
+    n_rows = 1_000
+
+    # DATASET A: Lista de Listas
+    data_masiva = []
+    for i in range(n_rows):
+        data_masiva.append([
+            i,
+            complex(i, i * 0.1),
+            random.random() * 100,
+            i % 2 == 0
+        ])
+
+    # DATASET B: Lista de Numpy Void (Estructurados)
+    dtype_struct = np.dtype([
+        ("id", "i8"),
+        ("c_val", "c16"),
+        ("score", "f8"),
+        ("active", "?"),
+    ])
+    # Generación vectorizada rápida para el test
+    arr_struct = np.zeros(n_rows, dtype=dtype_struct)
+    arr_struct['id'] = np.arange(n_rows)
+    arr_struct['c_val'] = np.arange(n_rows) + 1j * (np.arange(n_rows) * 0.5)
+    arr_struct['score'] = np.random.rand(n_rows) * 100
+    arr_struct['active'] = (np.arange(n_rows) % 2 == 0)
+    data_masiva_struct = [arr_struct[i] for i in range(n_rows)]  # Convertimos a lista para el input
+
+    # ==========================================
+    # BLOQUE 1: PRUEBAS CTable
+    # ==========================================
+    print("\n" + "=" * 40)
+    print("     INICIANDO PRUEBAS CTable")
+    print("=" * 40)
+
+    # Pre-llenamos una tabla para el test 1
+    tabla_origen = CTable(RowModel)
+    tabla_origen.extend(data_masiva)
+
+    # --- PRUEBA 1: CTable -> CTable ---
+    print("1. CTable: Extend desde otra CTable")
+    tabla_test_1 = CTable(RowModel)
+    inicio = time.perf_counter()
+    tabla_test_1.extend(tabla_origen)
+    fin = time.perf_counter()
+    t_ctable_1 = fin - inicio
+    print(f"   -> Tiempo: {t_ctable_1:.4f} s | {(n_rows / t_ctable_1):,.0f} filas/s")
+
+    # --- PRUEBA 2: Lista de Listas -> CTable ---
+    print("2. CTable: Extend desde Lista de Listas")
+    tabla_test_2 = CTable(RowModel)
+    inicio = time.perf_counter()
+    tabla_test_2.extend(data_masiva)
+    fin = time.perf_counter()
+    t_ctable_2 = fin - inicio
+    print(f"   -> Tiempo: {t_ctable_2:.4f} s | {(n_rows / t_ctable_2):,.0f} filas/s")
+
+    # --- PRUEBA 3: Lista Numpy Struct -> CTable ---
+    print("3. CTable: Extend desde Lista de Numpy Structs")
+    tabla_test_3 = CTable(RowModel)
+    inicio = time.perf_counter()
+    tabla_test_3.extend(data_masiva_struct)
+    fin = time.perf_counter()
+    t_ctable_3 = fin - inicio
+    print(f"   -> Tiempo: {t_ctable_3:.4f} s | {(n_rows / t_ctable_3):,.0f} filas/s")
+
+    # ==========================================
+    # BLOQUE 2: COMPARATIVA PANDAS
+    # ==========================================
+    print("\n" + "=" * 40)
+    print("     INICIANDO COMPARATIVA PANDAS")
+    print("=" * 40)
+
+    cols = ['id', 'c_val', 'score', 'active']
+
+    # Preparamos DataFrame origen para el test 1
+    df_origen = pd.DataFrame(data_masiva, columns=cols)
+
+    # --- PANDAS 1: DataFrame -> DataFrame (Concat/Extend) ---
+    print("1. Pandas: Concat desde otro DataFrame")
+    df_test_1 = pd.DataFrame(columns=cols)  # DataFrame vacío inicial
+    inicio = time.perf_counter()
+    # pd.concat es el equivalente a extender una tabla con otra
+    df_test_1 = pd.concat([df_test_1, df_origen], ignore_index=True)
+    fin = time.perf_counter()
+    t_pandas_1 = fin - inicio
+    print(f"   -> Tiempo: {t_pandas_1:.4f} s | {(n_rows / t_pandas_1):,.0f} filas/s")
+
+    # --- PANDAS 2: Lista de Listas -> DataFrame ---
+    print("2. Pandas: Creación desde Lista de Listas")
+    inicio = time.perf_counter()
+    df_test_2 = pd.DataFrame(data_masiva, columns=cols)
+    # Forzamos inferencia de tipos o conversión si fuera necesario para ser justos,
+    # pero pandas por defecto lo hace rápido.
+    fin = time.perf_counter()
+    t_pandas_2 = fin - inicio
+    print(f"   -> Tiempo: {t_pandas_2:.4f} s | {(n_rows / t_pandas_2):,.0f} filas/s")
+
+    # --- PANDAS 3: Lista Numpy Struct -> DataFrame ---
+    print("3. Pandas: Creación desde Lista de Numpy Structs")
+    inicio = time.perf_counter()
+    # Pandas acepta lista de registros numpy void
+    df_test_3 = pd.DataFrame(data_masiva_struct)
+    fin = time.perf_counter()
+    t_pandas_3 = fin - inicio
+    print(f"   -> Tiempo: {t_pandas_3:.4f} s | {(n_rows / t_pandas_3):,.0f} filas/s")
+
+    # ==========================================
+    # RESUMEN FINAL
+    # ==========================================
+    print("\n" + "=" * 40)
+    print("RESUMEN DE TIEMPOS (Segundos - Menos es mejor)")
+    print("=" * 40)
+    print(f"{'PRUEBA':<30} | {'CTable':<10} | {'Pandas':<10} | {'Diferencia':<10}")
+    print("-" * 70)
+    print(
+        f"{'1. Table Copy/Extend':<30} | {t_ctable_1:.4f}s    | {t_pandas_1:.4f}s    | x{t_pandas_1 / t_ctable_1:.2f}")
+    print(
+        f"{'2. Ingesta Lista Python':<30} | {t_ctable_2:.4f}s    | {t_pandas_2:.4f}s    | x{t_pandas_2 / t_ctable_2:.2f}")
+    print(
+        f"{'3. Ingesta Numpy Structs':<30} | {t_ctable_3:.4f}s    | {t_pandas_3:.4f}s    | x{t_pandas_3 / t_ctable_3:.2f}")
+    print("-" * 70)
+
+    """
+
+
