@@ -376,35 +376,28 @@ class CTable(Generic[RowT]):
         self._n_rows += 1
 
     def delete(self, pos: int | list[int]) -> None:
-        if isinstance(pos, list):
-            if not isinstance(pos[0], int):
+
+        if isinstance(pos, list) or isinstance(pos, int):
+            if isinstance(pos, list) and not isinstance(pos[0], int):
                 raise TypeError("Position must be an integer or a list of integers")
-            desp = 1
-            for i in range(min(pos), self._n_rows-len(pos)):
-                for v in self._cols.values():
-                    while(i+desp in pos):
-                        desp += 1
-                    v[i] = v[i + desp]
+            elif isinstance(pos, int) and pos > self._n_rows:
+                raise IndexError("Index out of range")
+            elif isinstance(pos, int) and pos < 0:
+                pos = self._n_rows + pos
+            pos = [pos] if isinstance(pos, int) else pos
+            LS = list(pos)
+
+            for k, v in self._cols.items():
+                sust = v[:]
+                sust[LS] = False
+                sust = np.flatnonzero(sust)
+                self._cols[k] = blosc2.asarray(sust)
 
             self._capacity = self._capacity - len(pos)
 
             for col_array in self._cols.values():
                 col_array.resize((self._capacity,))
             self._n_rows = self._n_rows - len(pos)
-
-        elif isinstance(pos, int):
-            if pos > self._n_rows:
-                raise IndexError("Index out of range")
-            elif pos < 0:
-                pos = self._n_rows + pos
-
-            for i in range(pos, self._n_rows-1):
-                for v in self._cols.values():
-                    v[i] = v[i+1]
-            self._capacity = self._capacity -1
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-            self._n_rows = self._n_rows-1
 
         else:
             raise TypeError("Position must be an integer or a list of integers")
@@ -551,7 +544,7 @@ class CTable(Generic[RowT]):
 
         return retval
 
-    def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
+    def _run_row_logic(self, ind: int | slice | str) -> list | list[list] | None:
         if isinstance(ind, str):
             try:
                 parts = [p.strip() for p in ind.split(':')]
@@ -568,30 +561,24 @@ class CTable(Generic[RowT]):
 
         if isinstance(ind, int):
             if 0 <= ind < self._n_rows:
-                index: int = ind
+                index = ind
             elif -self._n_rows <= ind < 0:
-                index: int = self._n_rows + ind
+                index = self._n_rows + ind
             else:
                 raise IndexError("list index out of range")
 
-            data = {}
-            for name, col in self._cols.items():
-                arr_val = col[index]
-                data[name] = arr_val[()]
-            '''if hasattr(arr_val, 'item'):
-                    data[name] = arr_val.item()
-                else:
-                    data[name] = arr_val'''
-            return self._row_type(**data)
-
+            return [col[index][()] for col in self._cols.values()]
 
         if isinstance(ind, slice):
             indices = range(*ind.indices(self._n_rows))
             return [self._run_row_logic(i) for i in indices]
 
-        raise  TypeError(
-        f"Invalid argument type. Expected 'int' or 'slice', "
-        f"but got '{type(ind).__name__}'."
+        if isinstance(ind, (list, tuple)) or (isinstance(ind, Iterable) and not isinstance(ind, str)):
+            return [self._run_row_logic(i) for i in ind]
+
+        raise TypeError(
+            f"Invalid argument type. Expected 'int' or 'slice', "
+            f"but got '{type(ind).__name__}'."
         )
 
 
@@ -747,7 +734,7 @@ if __name__ == "__main__":
     ]
 
     print("Generando 1,000,000 filas de prueba con complejos...")
-    n_rows = 100_000
+    n_rows = 1_000_000
 
     # Generación masiva actualizada
     data_masiva = []
@@ -788,7 +775,9 @@ if __name__ == "__main__":
 
     inicio = time.perf_counter()
 
-    tabla_test_2.delete(list(range(0, len(tabla_test_2), 4)))
+    #a = tabla_test.row[list(range(0, tabla_test.nrows, 4))]
+    #tabla_test_2.extend(a)
+    tabla_test_2.delete(0)
 
     fin = time.perf_counter()
 
@@ -800,6 +789,17 @@ if __name__ == "__main__":
     print(f"Tiempo total:     {tiempo_total:.4f} segundos")
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
     print(len(tabla_test_2))
+
+
+
+    #El siguiente fragmento hay que incorporarlo al delete para que, usando .row[lista] saque el complementario de las posiciones
+    # e inserte las nuevas lineas.
+    n = 100_000
+    LS = list(range(0,n+1, 3))
+    mask = np.ones(n + 1, dtype=bool)
+    mask[LS] = False
+    n_LS = np.flatnonzero(mask)
+
 
 
 
