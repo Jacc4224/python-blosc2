@@ -674,7 +674,7 @@ class CTable(Generic[RowT]):
 
 
 if __name__ == "__main__":
-    n_rows = 10_000
+    n_rows = 200_001
     print(f"Generando {n_rows} filas de prueba con complejos...")
 
     # Generación masiva actualizada
@@ -711,9 +711,24 @@ if __name__ == "__main__":
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
     print(len(tabla_test))
 
+
+    a = (tabla_test["id"]>100)
+
+    inicio = time.perf_counter()
+
+    filtrado = tabla_test.filter(a)
+
+    fin = time.perf_counter()
+
+    tiempo_total = fin - inicio
+
+    print(f"\n=== RESULTADOS ===")
+    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
+
+
     print(tabla_test["id"].shape)
     chunk = tabla_test["id"].get_chunk(0)
     decompressed_chunk = blosc2.decompress(chunk)
     np_array_chunk = np.frombuffer(decompressed_chunk, dtype=np.int64)
-    print(decompressed_chunk)
+
 
