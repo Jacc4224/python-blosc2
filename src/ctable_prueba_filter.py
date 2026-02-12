@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
 from blosc2 import concat
+from blosc2.lazyexpr import get_chunk
 
 """ Imports extra """
 import time
@@ -501,17 +502,21 @@ class CTable(Generic[RowT]):
                 raise TypeError(f"Column {i} ('{current_col_names[i]}') conversion error: {e}")
 
 
-        old_nrows = self._n_rows
-        self._n_rows += new_nrows
-        self._capacity = self._n_rows
+
 
         for i, name in enumerate(current_col_names):
             target_array = self._cols[name]
             source_array = processed_cols[i]
-            self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
+            if self._n_rows == 0:
+                self._cols[name] = source_array
+            else:
+                self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
 
             #target_array.resize((self._capacity,))
             #target_array[old_nrows:self._n_rows] = source_array[:]
+        old_nrows = self._n_rows
+        self._n_rows += new_nrows
+        self._capacity = self._n_rows
 
     @profile
     def filter(self, expr_result) -> CTable:
@@ -579,8 +584,6 @@ class CTable(Generic[RowT]):
             f"Invalid argument type. Expected 'int' or 'slice', "
             f"but got '{type(ind).__name__}'."
         )
-
-
 
     """Save y load por revisar: ha habido cambios como _key"""
 
@@ -691,14 +694,11 @@ if __name__ == "__main__":
     tabla_test = CTable(RowModel)
     tabla_test.extend(data_masiva)
 
-    tabla_test_2 = CTable(RowModel)
-    tabla_test_2.extend(data_masiva)
-
     print("Comenzando prueba de rendimiento 1...")
 
     inicio = time.perf_counter()
 
-    tabla_test_2.extend(tabla_test)
+    tabla_test.extend(data_masiva)
 
     fin = time.perf_counter()
 
@@ -709,12 +709,11 @@ if __name__ == "__main__":
     print(f"Filas insertadas: {n_rows:,}")
     print(f"Tiempo total:     {tiempo_total:.4f} segundos")
     print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
-    print(len(tabla_test_2))
+    print(len(tabla_test))
 
-
-    mask = ((tabla_test['id'] < 500) & (tabla_test['score'] < 50.0))
-    print(type(mask))
-
-    prueba = tabla_test.filter(mask)
-
+    print(tabla_test["id"].shape)
+    chunk = tabla_test["id"].get_chunk(0)
+    decompressed_chunk = blosc2.decompress(chunk)
+    np_array_chunk = np.frombuffer(decompressed_chunk, dtype=np.int64)
+    print(decompressed_chunk)
 
