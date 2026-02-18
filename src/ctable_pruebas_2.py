@@ -12,17 +12,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from dataclasses import Field
-from email.policy import strict
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
-from algoritmia.schemes.dac_scheme import tail_dec_solve
 from line_profiler import profile
 from numpy.ma.core import append
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
-from blosc2 import concat, compute_chunks_blocks
+from blosc2 import concat, compute_chunks_blocks, where
 
 """ Imports extra """
 import time
@@ -339,11 +337,12 @@ class CTable(Generic[RowT]):
 
         pos = 0
         cont = 0
-        while cont < self._n_rows:
+        while cont < self._n_rows:          #Cambiar por nueva sintaxis más rápida
             if self._valid_rows[pos]:
                 cont += 1
             pos += 1
 
+        #validar que el dáto no se vaya a poner en última posición
 
         if is_list:
             for i, col_array in enumerate(col_values):
@@ -432,22 +431,29 @@ class CTable(Generic[RowT]):
                 (getattr(expr_result, 'dtype', None) == np.bool_)):
             raise TypeError(f"Expected boolean blosc2.NDArray or LazyExpr, got {type(expr_result).__name__}")
 
-        filtro = expr_result.compute() if isinstance(expr_result, blosc2.LazyExpr) else expr_result
-        filtro = filtro[:self._n_rows]
+        filter = expr_result.compute() if isinstance(expr_result, blosc2.LazyExpr) else expr_result
 
-        real_poss = blosc2.where(self._valid_rows[:self._n_rows],
-                                 np.array(range(self._n_rows))).compute()
+        target_len = len(self._valid_rows)
 
-        filtro_validas = filtro[real_poss]
+        if len(filter) > target_len:
+            filter = filter[:target_len]
+        elif len(filter) < target_len:
+            padding = blosc2.zeros(target_len, dtype=np.bool_)
+            padding[:len(filter)] = filter[:]
+            filter = padding
 
-        retval = CTable(self._row_type)
-        n_true = len(blosc2.where(filtro_validas, np.arange(len(filtro_validas))).compute())
-        retval._n_rows = n_true
-        retval._capacity = n_true
+        filter = (filter & self._valid_rows).compute()
+        new_nrows = blosc2.count_nonzero(filter)
 
-        for k in self._cols.keys():
-            source_filt = self._cols[k][real_poss][filtro_validas]
-            retval._cols[k][:n_true] = source_filt
+        retval = CTable(self._row_type, expected_size=target_len)
+
+        for k, v in retval._cols.items():
+            v[:] = self._cols[k][:]
+
+        retval._valid_rows = filter
+        retval._n_rows = int(new_nrows)
+        retval._compact()
+
 
         return retval
 
@@ -493,86 +499,11 @@ class CTable(Generic[RowT]):
     """Save y load por revisar: ha habido cambios como _key"""
 
     def save(self, urlpath: str, group: str = "table") -> None:
-        """
-        Persist columns into a single TreeStore container.
-        Each column is stored under a group / colname.
-        """
-        with blosc2.TreeStore(urlpath, mode="w") as ts:
-            arrays = self._cols
-            for name, arr in arrays.items():
-                node_path = f"{group}/{name}"
-                # Store as compressed NDArray inside the tree
-                print(f"Storing {name} with shape {arr[:self._n_rows].shape} and dtype {arr.dtype} in {node_path}")
-                ts[node_path] = arr[:self._n_rows]
+        ...
 
     @classmethod
     def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> CTable:
-        with blosc2.TreeStore(urlpath, mode="r") as ts:
-            keys = list(ts.keys()) if hasattr(ts, "keys") else []
-            prefix = f"/{group}/" if not group.startswith("/") else f"{group}/"
-            field_names = []
-            for k in keys:
-                k_norm = f"/{k.strip('/')}"
-                if k_norm.startswith(prefix):
-                    field_names.append(k_norm[len(prefix):])
-
-            field_names.sort()
-
-            b2_arrays: dict[str, blosc2.NDArray] = {}
-            annotations: dict[str, Any] = {}
-            defaults: dict[str, Any] = {}
-            loaded_nrows = 0
-
-            for field in field_names:
-                node_path = f"{group}/{field}"
-                stored_array = ts[node_path]
-                b2_arr = blosc2.asarray(stored_array)
-                b2_arrays[field] = b2_arr
-
-                if loaded_nrows == 0 and b2_arr.shape[0] > 0:
-                    loaded_nrows = b2_arr.shape[0]
-
-                if row_type is None:
-                    dt = b2_arr.dtype
-                    kind = dt.kind
-
-                    if kind == "U":
-                        char_size = np.dtype("U1").itemsize
-                        max_len = dt.itemsize // char_size
-                        annotations[field] = Annotated[str, MaxLen(int(max_len))]
-                        defaults[field] = Field(default="")
-                    elif kind == "S":
-                        max_len = dt.itemsize
-                        annotations[field] = Annotated[bytes, MaxLen(int(max_len))]
-                        defaults[field] = Field(default=b"")
-                    elif kind in ("i", "u"):
-                        annotations[field] = Annotated[int, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0)
-                    elif kind == "f":
-                        annotations[field] = Annotated[float, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0.0)
-                    elif kind == "c":
-                        annotations[field] = Annotated[complex, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0j)
-                    elif kind == "b":
-                        annotations[field] = Annotated[bool, NumpyDtype(dt)]
-                        defaults[field] = Field(default=False)
-                    else:
-                        annotations[field] = Annotated[Any, NumpyDtype(dt)]
-                        defaults[field] = Field(default=None)
-
-            if row_type is None:
-                model_fields = {}
-                for name, ann in annotations.items():
-                    model_fields[name] = (ann, defaults.get(name, ...))
-                row_type = create_model("InferredRowModel", __base__=BaseModel, **model_fields)
-
-            tbl = cls(row_type)
-
-            tbl._cols = b2_arrays
-            tbl._n_rows = loaded_nrows
-            tbl._capacity = loaded_nrows
-            return tbl
+        ...
 
 
 
@@ -587,13 +518,19 @@ if __name__ == "__main__":
 
     n_rows = 10_000_000
     data_masiva = []
+    print(f"Creando {n_rows} filas.")
+
+    start = time.perf_counter()
     for i in range(n_rows):
         data_masiva.append([
             i,
-            complex(i, i * 0.1),  # Valor complejo en lugar del string f"User_{i}"
+            complex(i, i * 0.1),
             random.random() * 100,
             i % 2 == 0
         ])
+    stop = time.perf_counter()
+    print(f"Tiempo creación de datos: {stop - start:.4f} s")
+    print("------------------------------------------------------")
 
     tabla = CTable(RowModel)
     tabla2=CTable(RowModel)
@@ -601,13 +538,14 @@ if __name__ == "__main__":
     tabla.extend(data_masiva)
     stop = time.perf_counter()
     print(f"Tiempo extend: {stop - start:.4f} s")
-    print(len(tabla))
+    print("------------------------------------------------------")
 
     start = time.perf_counter()
     tabla2.extend(tabla)
     stop = time.perf_counter()
     print(f"Tiempo extend CTable: {stop - start:.4f} s")
-    print(len(tabla2))
+    print("------------------------------------------------------")
+
 
 
     numeros = random.sample(range(0, 100_000), 50_000)
@@ -615,13 +553,30 @@ if __name__ == "__main__":
     tabla.delete(numeros)
     stop = time.perf_counter()
     print(f"Tiempo delete: {stop - start:.4f} s")
-    print(len(tabla))
+    print("------------------------------------------------------")
+
 
     start = time.perf_counter()
     tabla._compact()
     stop = time.perf_counter()
     print(f"Tiempo compact: {stop - start:.4f} s")
-    print(len(tabla))
+    print("------------------------------------------------------")
 
 
 
+    filtro = ((tabla['id'] <=1_000) & (tabla['score'] > 80)).compute()
+    start = time.perf_counter()
+    tabla2 = tabla.filter(filtro)
+    stop = time.perf_counter()
+    print(f"Tiempo filter: {stop - start:.4f} s")
+    print("------------------------------------------------------")
+
+
+
+    # En el main
+    total_comprimido = sum(col.cbytes for col in tabla._cols.values()) + tabla._valid_rows.cbytes
+    total_sin_comprimir = sum(col.nbytes for col in tabla._cols.values()) + tabla._valid_rows.nbytes
+
+    print(f"Comprimido: {total_comprimido / 1024 ** 2:.2f} MB")
+    print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
+    print(f"Ratio: {total_comprimido / total_sin_comprimir:.2%}")
