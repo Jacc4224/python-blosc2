@@ -17,11 +17,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
 from algoritmia.schemes.dac_scheme import tail_dec_solve
+from line_profiler import profile
 from numpy.ma.core import append
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
-from blosc2 import concat
+from blosc2 import concat, compute_chunks_blocks
 
 """ Imports extra """
 import time
@@ -78,16 +79,19 @@ class _RowIndexer:
 
 class CTable(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data = None, key: str = None) -> None:
+    def __init__(self, row_type: type[RowT], new_data = None, key: str = None, expected_size: int = 1_048_576) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
-        self._capacity: int = 1
+        self._capacity: int = expected_size
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
         self._col_names = []
         self.row = _RowIndexer(self)
         self._key: str = key
         self._key_set: set[Any] = set()
+
+        c, b = compute_chunks_blocks((expected_size,))
+        self._valid_rows = blosc2.zeros(shape=c, dtype = np.bool_ , chunks=c, blocks=b)
 
 
         for name, field in row_type.model_fields.items():
@@ -137,7 +141,7 @@ class CTable(Generic[RowT]):
             final_width = max(len(name), display_width)
             self._col_widths[name] = final_width        # Usefull in __str__
 
-            self._cols[name] = blosc2.zeros(shape=1, dtype=dt)
+            self._cols[name] = blosc2.zeros(shape=c, dtype=dt, chunks=c, blocks=b)
 
         if new_data is not None:
             is_append = False
@@ -173,14 +177,18 @@ class CTable(Generic[RowT]):
 
 
         # We print the rows
+        j=0
         for i in range(self._n_rows):
+            while not self._valid_rows[j]:
+                j += 1
             for name in self._cols.keys():
-                retval.append(f"{self._cols[name][i]:^{self._col_widths[name]}}")
+                retval.append(f"{self._cols[name][j]:^{self._col_widths[name]}}")
                 retval.append(f" |")
             retval.append("\n")
-            for i in range(cont):
+            for _ in range(cont):
                 retval.append("-")
             retval.append("\n")
+            j+=1
         return "".join(retval)
 
     def __len__(self):
@@ -243,6 +251,12 @@ class CTable(Generic[RowT]):
     def __getattr__(self, s: str):
         return self._cols[s] if s in self._cols else super().__getattribute__(s)
 
+    def _compact(self):
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        for k, v in self._cols.items():
+            v[:self._n_rows] = v[real_poss[:self._n_rows]]
+        self._valid_rows[:self._n_rows] = True
+        self._valid_rows[self._n_rows:] = False
 
     # Revisar
     def __setitem__(self, key, value):
@@ -311,7 +325,6 @@ class CTable(Generic[RowT]):
 
     def append(self, data: list | np.void | np.ndarray) -> None:
         is_list = isinstance(data, (list, tuple))
-        key_value = None
         col_values = list(self._cols.values())
         col_names = self._col_names
 
@@ -320,22 +333,6 @@ class CTable(Generic[RowT]):
 
         if is_list and len(data) != len(col_values):
             raise ValueError(f"Expected {len(col_values)} values, received {len(data)}")
-
-        if self._key is not None:
-            if is_list:
-                try:
-                    key_idx = col_names.index(self._key)
-                    key_value = data[key_idx]
-                except ValueError:
-                    raise KeyError(f"Key column '{self._key}' does not exist.")
-            else:
-                try:
-                    key_value = data[self._key]
-                except (IndexError, KeyError, ValueError):
-                    raise KeyError(f"Input data does not contain the key field '{self._key}'")
-
-            if key_value in self._key_set:
-                raise KeyError(f"Key '{key_value}' already exists in column '{self._key}'")
 
         if is_list:
             for i, val in enumerate(data):
@@ -357,21 +354,21 @@ class CTable(Generic[RowT]):
                 except (ValueError, TypeError):
                     raise TypeError(f"Value '{val}' in field '{name}' is not compatible with type {arr.dtype}")
 
-        self._capacity += 1
-        for col_array in col_values:
-            col_array.resize((self._capacity,))
+        pos = 0
+        cont = 0
+        while cont < self._n_rows:
+            if self._valid_rows[pos]:
+                cont += 1
+            pos += 1
 
 
         if is_list:
             for i, col_array in enumerate(col_values):
-                col_array[self._n_rows] = data[i]
+                col_array[pos] = data[i]
         else:
             for name, col_array in self._cols.items():
-                col_array[self._n_rows] = data[name]
-
-
-        if self._key is not None:
-            self._key_set.add(key_value)
+                col_array[pos] = data[name]
+        self._valid_rows[pos] = True
 
         self._n_rows += 1
 
@@ -385,133 +382,54 @@ class CTable(Generic[RowT]):
             elif isinstance(pos, int) and pos < 0:
                 pos = self._n_rows + pos
             pos = [pos] if isinstance(pos, int) else pos
-            LS = list(pos)
 
-            for k, v in self._cols.items():
-                sust = v[:]
-                sust[LS] = False
-                sust = np.flatnonzero(sust)
-                self._cols[k] = blosc2.asarray(sust)
+            LS = np.array(pos)
 
-            self._capacity = self._capacity - len(pos)
+            real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
 
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+            self._valid_rows[real_poss[LS]] = False
             self._n_rows = self._n_rows - len(pos)
 
         else:
             raise TypeError("Position must be an integer or a list of integers")
 
     def extend(self, data: list | CTable | Any) -> None:
-        if isinstance(data, dict):
-            raise TypeError("Dictionaries are not supported in extend.")
+        ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
 
-        current_col_names = getattr(self, "_col_names", list(self._cols.keys()))
-        current_col_values = [self._cols[name] for name in current_col_names]
-
+        current_col_names = self._col_names
         columns_to_insert = []
         new_nrows = 0
 
-        if hasattr(data, "_cols") and hasattr(data, "nrows"):
-            if len(data._cols) != len(current_col_names):
-                raise ValueError(f"Input CTable has {len(data._cols)} columns, expected {len(current_col_names)}")
-
+        if hasattr(data, "_cols") and hasattr(data, "_n_rows"):
             for name in current_col_names:
-                if name not in data._cols:
-                    raise ValueError(f"Input CTable missing column '{name}'")
-
-                if data._cols[name].dtype != self._cols[name].dtype:
-                    raise TypeError(
-                        f"Column '{name}' dtype mismatch. Source: {data._cols[name].dtype}, Target: {self._cols[name].dtype}")
-
-                columns_to_insert.append(data._cols[name])
-
-            new_nrows = data.nrows
-
-
-        elif isinstance(data, (list, tuple, np.ndarray)):
-            if len(data) == 0:
-                return
-
+                col = data._cols[name][:data._n_rows]
+                columns_to_insert.append(col)
+            new_nrows = data._n_rows
+        else:
             if isinstance(data, np.ndarray) and data.dtype.names is not None:
-                columns_to_insert = []
                 for name in current_col_names:
-                    if name not in data.dtype.names:
-                        raise ValueError(f"Input structured array is missing required field '{name}'")
                     columns_to_insert.append(data[name])
                 new_nrows = len(data)
-
-            elif isinstance(data[0], (np.void, np.record)):
-                try:
-                    structured_source = np.array(data, dtype=data[0].dtype)
-                    columns_to_insert = []
-                    for name in current_col_names:
-                        if name not in structured_source.dtype.names:
-                            raise ValueError(f"Input data is missing required field '{name}'")
-                        columns_to_insert.append(structured_source[name])
-                    new_nrows = len(data)
-
-                except Exception:
-                    columns_to_insert = []
-                    for name in current_col_names:
-                        columns_to_insert.append([row[name] for row in data])
-                    new_nrows = len(data)
-
             else:
-                first_row = data[0]
-                if len(first_row) != len(current_col_names):
-                    raise ValueError(
-                        f"Rows must have {len(current_col_names)} items, but first row has {len(first_row)}")
-                try:
-                    columns_to_insert = list(zip(*data, strict=True))
-
-                except TypeError:
-                    columns_to_insert = list(zip(*data))
-
-                except ValueError:
-                    raise ValueError("Inconsistent row lengths in input data.")
-
-                except Exception:
-                    raise ValueError("Error transposing data. Ensure all rows are iterable.")
-
-                if len(columns_to_insert) != len(current_col_names):
-                    raise ValueError(f"Data has {len(columns_to_insert)} columns, expected {len(current_col_names)}.")
-
+                columns_to_insert = list(zip(*data))
                 new_nrows = len(data)
-
-        else:
-            raise TypeError("Data format not supported in extend.")
-
-        if new_nrows == 0:
-            return
 
         processed_cols = []
         for i, raw_col in enumerate(columns_to_insert):
-            target_dtype = current_col_values[i].dtype
-            try:
-                if isinstance(raw_col, blosc2.NDArray) and raw_col.dtype == target_dtype:
-                    b2_arr = raw_col
-                else:
-                    b2_arr = blosc2.asarray(raw_col, dtype=target_dtype)
+            target_dtype = self._cols[current_col_names[i]].dtype
+            b2_arr = blosc2.asarray(raw_col, dtype=target_dtype)
+            processed_cols.append(b2_arr)
 
-                processed_cols.append(b2_arr)
-            except Exception as e:
-                raise TypeError(f"Column {i} ('{current_col_names[i]}') conversion error: {e}")
+        end_pos = start_pos + new_nrows
+        self._n_rows = max(self._n_rows, end_pos)
 
+        for j, name in enumerate(current_col_names):
+            self._cols[name][start_pos:end_pos] = processed_cols[j][:]
 
-        old_nrows = self._n_rows
-        self._n_rows += new_nrows
-        self._capacity = self._n_rows
+        self._valid_rows[start_pos:end_pos] = True
 
-        for i, name in enumerate(current_col_names):
-            target_array = self._cols[name]
-            source_array = processed_cols[i]
-            self._cols[name] = blosc2.concat([target_array, source_array], axis=0)
-
-            #target_array.resize((self._capacity,))
-            #target_array[old_nrows:self._n_rows] = source_array[:]
-
-
+    @profile
     def filter(self, expr_result) -> CTable:
         filtro = None
         if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and expr_result.dtype == np.bool_):
@@ -672,66 +590,9 @@ if __name__ == "__main__":
     import time
     import random
 
-    # Definimos el dtype: cambiamos 'name' (U10) por 'c_val' (complex128 -> 'c16')
-    dt = np.dtype([('id', 'i8'), ('c_val', 'c16'), ('score', 'f8'), ('active', '?')])
-
-    # Ajustamos los datos para incluir números complejos en la segunda posición
-
-    data_1 = [
-        [101, 10.1 + 1.1j, 85.5, True],
-        [102, 20.2 + 2.2j, 92.0, False],
-        [103, 30.3 + 3.3j, 78.5, True]
-    ]
-
-    data_2 = [
-        [104, 40.4 + 4.4j, 60.0, False]
-    ]
-
-    data_3 = np.array([
-        (201, 5.5 + 0.5j, 88.5, True),
-        (202, 6.6 + 1.6j, 90.0, True),
-        (203, 7.7 + 2.7j, 75.0, False),
-        (204, 8.8 + 3.8j, 95.5, True),
-        (205, 9.9 + 4.9j, 80.0, False)
-    ], dtype=dt)
-
-    _temp_arr = np.array([
-        (301, 11.1 + 5.1j, 99.9, True),
-        (302, 12.2 + 6.2j, 15.5, False),
-        (303, 13.3 + 7.3j, 67.0, True)
-    ], dtype=dt)
-    data_4 = [row for row in _temp_arr]
-
-    '''data_5 = CTable(RowModel, new_data=[
-        [401, 14.4 + 8.4j, 55.0, True],
-        [402, 15.5 + 9.5j, 89.0, True]
-    ])'''
-
-    data_6 = (
-        (501, 16.6 + 10.6j, 45.0, False),
-        (502, 17.7 + 11.7j, 91.0, True),
-        (503, 18.8 + 12.8j, 82.5, False),
-        (504, 19.9 + 13.9j, 77.0, True)
-    )
-
-    data_7 = []
-    for i in range(20):
-        # Generamos un complejo dinámico basado en i
-        data_7.append([600 + i, complex(i, i * 2.5), 50.0 + i, i % 2 == 0])
-
-    # np.void con complejo
-    data_8 = np.array([(700, 50 + 50j, 10.0, True)], dtype=dt)[0]
-
-    data_9 = [np.array([(701, 60 - 20j, 20.0, False)], dtype=dt)[0]]
-
-    data_10 = [
-        [801, 100 + 0j, 33.3, True],  # Lista con complejo puro real
-        (802, 0 + 200j, 44.4, False)  # Tupla con complejo puro imaginario
-    ]
-    n_rows = 1_000_000
-    print(f"Generando {n_rows} filas de prueba con complejos...")
-
     # Generación masiva actualizada
+
+    n_rows = 1_000_000
     data_masiva = []
     for i in range(n_rows):
         data_masiva.append([
@@ -741,105 +602,33 @@ if __name__ == "__main__":
             i % 2 == 0
         ])
 
-    # Nota: Asegúrate de que RowModel esté actualizado para tener un campo complejo
-    # compatible (ej. c_val = Col(dtype=np.complex128) o similar)
-
-    # Instanciamos la tabla vacía
-    tabla_test = CTable(RowModel)
-    tabla_test.extend(data_masiva)
-
-    tabla_test_2 = CTable(RowModel)
-    tabla_test_2.extend(data_masiva)
-
-    print("Comenzando prueba de rendimiento 1...")
-
-    inicio = time.perf_counter()
-
-    tabla_test_2.extend(tabla_test)
-
-    fin = time.perf_counter()
-
-    tiempo_total = fin - inicio
-    velocidad = n_rows / tiempo_total if tiempo_total > 0 else 0
-
-    print(f"\n=== RESULTADOS ===")
-    print(f"Filas insertadas: {n_rows:,}")
-    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
-    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
-    print(len(tabla_test_2))
+    tabla = CTable(RowModel)
+    start = time.perf_counter()
+    tabla.extend(data_masiva)
+    stop = time.perf_counter()
+    print(f"Tiempo extend: {stop - start:.4f} s")
+    print(len(tabla))
 
 
-
-    pos_borrado = [0]
-    inicio = time.perf_counter()
-
-    tabla_test_2.delete(pos_borrado)
-
-    fin = time.perf_counter()
-
-    tiempo_total = fin - inicio
-    velocidad = len(pos_borrado) / tiempo_total if tiempo_total > 0 else 0
-
-    print(f"\n=== RESULTADOS ===")
-    print(f"Filas borradas: {len(pos_borrado):,}")
-    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
-    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
-    print(len(tabla_test_2))
+    print(len(tabla))
 
 
+    numeros = random.sample(range(0, 1_000_000), 100)
+    start = time.perf_counter()
+    tabla.delete(numeros)
+    stop = time.perf_counter()
+    print(f"Tiempo delete: {stop - start:.4f} s")
+    print(len(tabla))
 
-    #El siguiente fragmento hay que incorporarlo al delete para que, usando .row[lista] saque el complementario de las posiciones
-    # e inserte las nuevas lineas.
-    n = 100_000
-    LS = list(range(0,n+1, 3))
-    mask = np.ones(n + 1, dtype=bool)
-    mask[LS] = False
-    n_LS = np.flatnonzero(mask)
+    for i in range(20):
+        if tabla._valid_rows[i]:
+            print(tabla._cols['id'][i])
 
-    dtype_fila = np.dtype([
-        ('id', 'i8'),
-        ('c_val', 'c16'),
-        ('score', 'f8'),
-        ('active', '?')
-    ])
+    start = time.perf_counter()
+    tabla._compact()
+    stop = time.perf_counter()
+    print(f"Tiempo compact: {stop - start:.4f} s")
+    print(len(tabla))
 
-    # Generamos los datos directamente en formato Numpy Structured Array
-    # (Hacemos esto vectorizado porque crear una lista de 1M en un bucle python para luego convertirla es lentísimo y falsearía la prueba)
-    data_masiva_np = np.zeros(n_rows, dtype=dtype_fila)
-
-    indices = np.arange(n_rows)
-    data_masiva_np['id'] = indices
-    data_masiva_np['c_val'] = indices + (indices * 0.1) * 1j
-    data_masiva_np['score'] = np.random.rand(n_rows) * 100
-    data_masiva_np['active'] = (indices % 2 == 0)
-
-    # Instanciamos la tabla vacía
-    tabla_test = CTable(RowModel)
-
-    print("Comenzando prueba de rendimiento extend(numpy_struct)...")
-
-    # 2. Medición del EXTEND
-    inicio = time.perf_counter()
-
-    tabla_test.extend(data_masiva_np)
-
-    fin = time.perf_counter()
-
-    # 3. Resultados
-    tiempo_total = fin - inicio
-    velocidad = n_rows / tiempo_total if tiempo_total > 0 else 0
-
-    print(f"\n=== RESULTADOS ===")
-    print(f"Filas insertadas: {n_rows:,}")
-    print(f"Tiempo total:     {tiempo_total:.4f} segundos")
-    print(f"Velocidad:        {velocidad:,.0f} filas/segundo")
-    print(len(tabla_test))
-
-
-
-    ################################################################
-
-
-
-
-
+    for i in range(10):
+        print(tabla._cols['id'][i])
