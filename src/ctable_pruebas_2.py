@@ -195,55 +195,38 @@ class CTable(Generic[RowT]):
         return self._n_rows
 
     def head(self, n: int = 5) -> CTable:
-        if not isinstance(n, int):
-            raise TypeError("n must be an integer")
-
-        start = 0
-        end = min(n, self._n_rows)
-
         if n <= 0:
-            return self.__class__(self._row_type)
+            return CTable(self._row_type)
 
-        new_table = self.__class__(self._row_type)
-        col_names = getattr(self, "_col_names", list(self._cols.keys()))
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        n_take = min(n, self._n_rows)
 
-        count = end - start
-        new_table._n_rows = count
-        new_table._capacity = count
+        retval = CTable(self._row_type)
+        retval._n_rows = n_take
+        retval._valid_rows[:n_take] = True
 
-        for name in col_names:
-            source_slice = self._cols[name][start:end]
-            new_table._cols[name].resize((count,))
-            new_table._cols[name][:] = source_slice
+        for k in self._cols.keys():
+            retval._cols[k][:n_take] = self._cols[k][real_poss[:n_take]]
 
-        if self._key is not None:
-            new_table._key = self._key
-            keys_slice = self._cols[self._key][start:end]
-            new_table._key_set = set(keys_slice)
-
-        return new_table
+        return retval
 
     def tail(self, n: int = 5) -> CTable:
-        if not isinstance(n, int):
-            raise TypeError("n must be an integer")
-        start = max(0, self._n_rows - n)
-        end = self._n_rows
         if n <= 0:
-            return self.__class__(self._row_type)
-        new_table = self.__class__(self._row_type)
-        col_names = getattr(self, "_col_names", list(self._cols.keys()))
-        count = end - start
-        new_table._n_rows = count
-        new_table._capacity = count
-        for name in col_names:
-            source_slice = self._cols[name][start:end]
-            new_table._cols[name].resize((count,))
-            new_table._cols[name][:] = source_slice
-        if self._key is not None:
-            new_table._key = self._key
-            keys_slice = self._cols[self._key][start:end]
-            new_table._key_set = set(keys_slice)
-        return new_table
+            return CTable(self._row_type)
+
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        start = max(0, self._n_rows - n)
+        n_take = min(n, self._n_rows)
+
+        retval = CTable(self._row_type)
+        retval._n_rows = n_take
+        retval._capacity = n_take
+        retval._valid_rows[:n_take] = True
+
+        for k in self._cols.keys():
+            retval._cols[k][:n_take] = self._cols[k][real_poss[start:start + n_take]]
+
+        return retval
 
     def __getitem__(self, s: str):
         return self._cols[s] if s in self._cols else None
@@ -422,7 +405,21 @@ class CTable(Generic[RowT]):
             processed_cols.append(b2_arr)
 
         end_pos = start_pos + new_nrows
-        self._n_rows = max(self._n_rows, end_pos)
+
+        if end_pos >= len(self._valid_rows):
+            self._compact()
+            ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
+            end_pos = start_pos + new_nrows
+
+        while end_pos > len(self._valid_rows):
+            c = len(self._valid_rows)
+            for name in current_col_names:
+                self._cols[name].resize((c*2,))
+            self._valid_rows.resize((c*2,))
+
+
+        self._n_rows = max(self._n_rows, end_pos) #revisar
 
         for j, name in enumerate(current_col_names):
             self._cols[name][start_pos:end_pos] = processed_cols[j][:]
@@ -431,30 +428,26 @@ class CTable(Generic[RowT]):
 
     @profile
     def filter(self, expr_result) -> CTable:
-        filtro = None
-        if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and expr_result.dtype == np.bool_):
-            raise TypeError(
-                f"Expected a boolean 'blosc2.NDArray' or 'blosc2.LazyExpr', "
-                f"but got type '{type(expr_result).__name__}' "
-                f"with dtype '{getattr(expr_result, 'dtype', 'N/A')}'."
-            )
-        if isinstance(expr_result, blosc2.LazyExpr):
-            filtro = expr_result.compute()
-        elif isinstance(expr_result, blosc2.NDArray) or (expr_result.dtype != np.bool_):
-            filtro = expr_result
-        filtro = filtro[:]
+        if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and
+                (getattr(expr_result, 'dtype', None) == np.bool_)):
+            raise TypeError(f"Expected boolean blosc2.NDArray or LazyExpr, got {type(expr_result).__name__}")
+
+        filtro = expr_result.compute() if isinstance(expr_result, blosc2.LazyExpr) else expr_result
+        filtro = filtro[:self._n_rows]
+
+        real_poss = blosc2.where(self._valid_rows[:self._n_rows],
+                                 np.array(range(self._n_rows))).compute()
+
+        filtro_validas = filtro[real_poss]
 
         retval = CTable(self._row_type)
-        n_true = np.count_nonzero(filtro)
+        n_true = len(blosc2.where(filtro_validas, np.arange(len(filtro_validas))).compute())
         retval._n_rows = n_true
         retval._capacity = n_true
-        if filtro is not None and len(filtro) >= self._n_rows:
-            for k in self._cols.keys():
-                retval._cols[k] = self._cols[k][filtro]
-        else:
-            raise ValueError(
-                f"Filter length ({len(filtro)}) does not match the number of rows ({self._n_rows})."
-            )
+
+        for k in self._cols.keys():
+            source_filt = self._cols[k][real_poss][filtro_validas]
+            retval._cols[k][:n_true] = source_filt
 
         return retval
 
@@ -592,7 +585,7 @@ if __name__ == "__main__":
 
     # Generación masiva actualizada
 
-    n_rows = 1_000_000
+    n_rows = 10_000_000
     data_masiva = []
     for i in range(n_rows):
         data_masiva.append([
@@ -603,26 +596,26 @@ if __name__ == "__main__":
         ])
 
     tabla = CTable(RowModel)
+    tabla2=CTable(RowModel)
     start = time.perf_counter()
     tabla.extend(data_masiva)
     stop = time.perf_counter()
     print(f"Tiempo extend: {stop - start:.4f} s")
     print(len(tabla))
 
+    start = time.perf_counter()
+    tabla2.extend(tabla)
+    stop = time.perf_counter()
+    print(f"Tiempo extend CTable: {stop - start:.4f} s")
+    print(len(tabla2))
 
-    print(len(tabla))
 
-
-    numeros = random.sample(range(0, 1_000_000), 100)
+    numeros = random.sample(range(0, 100_000), 50_000)
     start = time.perf_counter()
     tabla.delete(numeros)
     stop = time.perf_counter()
     print(f"Tiempo delete: {stop - start:.4f} s")
     print(len(tabla))
-
-    for i in range(20):
-        if tabla._valid_rows[i]:
-            print(tabla._cols['id'][i])
 
     start = time.perf_counter()
     tabla._compact()
@@ -630,5 +623,5 @@ if __name__ == "__main__":
     print(f"Tiempo compact: {stop - start:.4f} s")
     print(len(tabla))
 
-    for i in range(10):
-        print(tabla._cols['id'][i])
+
+
