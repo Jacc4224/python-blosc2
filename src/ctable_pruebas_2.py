@@ -15,6 +15,7 @@ from dataclasses import Field
 from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
+import tqdm
 from line_profiler import profile
 from numpy.ma.core import append
 from pydantic import BaseModel, Field, create_model, ValidationError
@@ -177,10 +178,9 @@ class CTable(Generic[RowT]):
         # We print the rows
 
         """Change this. Use where"""
-        j=0
-        for i in range(self._n_rows):
-            while not self._valid_rows[j]:
-                j += 1
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+
+        for j in real_poss:
             for name in self._cols.keys():
                 retval.append(f"{self._cols[name][j]:^{self._col_widths[name]}}")
                 retval.append(f" |")
@@ -188,7 +188,6 @@ class CTable(Generic[RowT]):
             for _ in range(cont):
                 retval.append("-")
             retval.append("\n")
-            j+=1
         return "".join(retval)
 
     def __len__(self):
@@ -346,6 +345,11 @@ class CTable(Generic[RowT]):
 
         ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
         pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
+        if pos >= len(self._valid_rows):
+            c = len(self._valid_rows)
+            for k,v in self._cols.items():
+                v.resize((c * 2,))
+            self._valid_rows.resize((c * 2,))
 
         if is_list:
             for i, col_array in enumerate(col_values):
@@ -457,7 +461,8 @@ class CTable(Generic[RowT]):
 
         retval._valid_rows = filter
         retval._n_rows = int(new_nrows)
-        retval.compact()
+        if self.auto_compact:
+            retval.compact()
 
         return retval
 
@@ -520,9 +525,10 @@ if __name__ == "__main__":
 
     # Generación masiva actualizada
 
-    n_rows = 10_000_000
+    n_rows = 1_000_000
     data_masiva = []
     print(f"Creando {n_rows} filas.")
+
 
     start = time.perf_counter()
     for i in range(n_rows):
@@ -542,6 +548,14 @@ if __name__ == "__main__":
     tabla.extend(data_masiva)
     stop = time.perf_counter()
     print(f"Tiempo extend: {stop - start:.4f} s")
+    print("------------------------------------------------------")
+
+
+    tabla2=CTable(RowModel)
+    start = time.perf_counter()
+    tabla2.append(data_masiva[0])
+    stop = time.perf_counter()
+    print(f"Tiempo append: {stop - start:.4f} s")
     print("------------------------------------------------------")
 
     start = time.perf_counter()
@@ -564,15 +578,9 @@ if __name__ == "__main__":
 
 
 
-    start = time.perf_counter()
-    tabla.compact()
-    stop = time.perf_counter()
-    print(f"Tiempo compact: {stop - start:.4f} s")
-    print("------------------------------------------------------")
 
 
-
-    filtro = ((tabla['id'] <=1_000_000) & (tabla['score'] < 80)).compute()
+    filtro = ((tabla['id'] <=1_000_000) & (tabla['score'] > 80)).compute()
     start = time.perf_counter()
     tabla2 = tabla.filter(filtro)
     stop = time.perf_counter()
@@ -588,3 +596,8 @@ if __name__ == "__main__":
     print(f"Comprimido: {total_comprimido / 1024 ** 2:.2f} MB")
     print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
     print(f"Ratio: {total_sin_comprimir/total_comprimido:.2}x")
+
+    print(tabla2.head(10))
+
+
+    print(tabla2.row[0:10])
