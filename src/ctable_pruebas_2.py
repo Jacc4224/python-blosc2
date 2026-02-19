@@ -77,7 +77,7 @@ class _RowIndexer:
 
 class CTable(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data = None, key: str = None, expected_size: int = 1_048_576) -> None:
+    def __init__(self, row_type: type[RowT], new_data = None, key: str = None, expected_size: int = 1_048_576, compact: bool = False) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
         self._capacity: int = expected_size
@@ -87,7 +87,7 @@ class CTable(Generic[RowT]):
         self.row = _RowIndexer(self)
         self._key: str = key
         self._key_set: set[Any] = set()
-
+        self.auto_compact = compact
         c, b = compute_chunks_blocks((expected_size,))
         self._valid_rows = blosc2.zeros(shape=c, dtype = np.bool_ , chunks=c, blocks=b)
 
@@ -175,6 +175,8 @@ class CTable(Generic[RowT]):
 
 
         # We print the rows
+
+        """Change this. Use where"""
         j=0
         for i in range(self._n_rows):
             while not self._valid_rows[j]:
@@ -194,12 +196,12 @@ class CTable(Generic[RowT]):
 
     def head(self, n: int = 5) -> CTable:
         if n <= 0:
-            return CTable(self._row_type)
+            return CTable(self._row_type, compact=self.auto_compact)
 
         real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
         n_take = min(n, self._n_rows)
 
-        retval = CTable(self._row_type)
+        retval = CTable(self._row_type, compact=self.auto_compact)
         retval._n_rows = n_take
         retval._valid_rows[:n_take] = True
 
@@ -232,10 +234,17 @@ class CTable(Generic[RowT]):
     def __getattr__(self, s: str):
         return self._cols[s] if s in self._cols else super().__getattribute__(s)
 
-    def _compact(self):
+    def compact(self):
         real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
-        for k, v in self._cols.items():
-            v[:self._n_rows] = v[real_poss[:self._n_rows]]
+        start = 0
+        block_size= self._valid_rows.blocks[0]
+        end = min(block_size, self._n_rows)
+        while start < end:
+            for k, v in self._cols.items():
+                v[start:end] = v[real_poss[start:end]]
+            start += block_size
+            end = min(end + block_size, self._n_rows)
+
         self._valid_rows[:self._n_rows] = True
         self._valid_rows[self._n_rows:] = False
 
@@ -335,14 +344,8 @@ class CTable(Generic[RowT]):
                 except (ValueError, TypeError):
                     raise TypeError(f"Value '{val}' in field '{name}' is not compatible with type {arr.dtype}")
 
-        pos = 0
-        cont = 0
-        while cont < self._n_rows:          #Cambiar por nueva sintaxis más rápida
-            if self._valid_rows[pos]:
-                cont += 1
-            pos += 1
-
-        #validar que el dáto no se vaya a poner en última posición
+        ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
 
         if is_list:
             for i, col_array in enumerate(col_values):
@@ -363,13 +366,14 @@ class CTable(Generic[RowT]):
                 raise IndexError("Index out of range")
             elif isinstance(pos, int) and pos < 0:
                 pos = self._n_rows + pos
-            pos = [pos] if isinstance(pos, int) else pos
+            pos  = np.array(pos)
+            pos.sort()
 
-            LS = np.array(pos)
+            real_pos = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
 
-            real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            aux = real_pos[pos]
+            self._valid_rows[aux]= False
 
-            self._valid_rows[real_poss[LS]] = False
             self._n_rows = self._n_rows - len(pos)
 
         else:
@@ -405,8 +409,8 @@ class CTable(Generic[RowT]):
 
         end_pos = start_pos + new_nrows
 
-        if end_pos >= len(self._valid_rows):
-            self._compact()
+        if self.auto_compact and end_pos >= len(self._valid_rows):
+            self.compact()
             ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
             start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
             end_pos = start_pos + new_nrows
@@ -418,8 +422,9 @@ class CTable(Generic[RowT]):
             self._valid_rows.resize((c*2,))
 
 
-        self._n_rows = max(self._n_rows, end_pos) #revisar
+        self._n_rows = max(self._n_rows, end_pos)
 
+        # Do this per chunks
         for j, name in enumerate(current_col_names):
             self._cols[name][start_pos:end_pos] = processed_cols[j][:]
 
@@ -445,15 +450,14 @@ class CTable(Generic[RowT]):
         filter = (filter & self._valid_rows).compute()
         new_nrows = blosc2.count_nonzero(filter)
 
-        retval = CTable(self._row_type, expected_size=target_len)
+        retval = CTable(self._row_type, expected_size=target_len, compact=self.auto_compact)
 
         for k, v in retval._cols.items():
             v[:] = self._cols[k][:]
 
         retval._valid_rows = filter
         retval._n_rows = int(new_nrows)
-        retval._compact()
-
+        retval.compact()
 
         return retval
 
@@ -548,23 +552,27 @@ if __name__ == "__main__":
 
 
 
-    numeros = random.sample(range(0, 100_000), 50_000)
+    numeros = random.sample(range(0, n_rows), n_rows//2)
+    n = blosc2.count_nonzero(tabla._valid_rows)
     start = time.perf_counter()
     tabla.delete(numeros)
     stop = time.perf_counter()
     print(f"Tiempo delete: {stop - start:.4f} s")
+    print(f"Longitud despues de delete: {blosc2.count_nonzero(tabla._valid_rows)}")
+    print(f"Valor esperado: {0}")
     print("------------------------------------------------------")
 
 
+
     start = time.perf_counter()
-    tabla._compact()
+    tabla.compact()
     stop = time.perf_counter()
     print(f"Tiempo compact: {stop - start:.4f} s")
     print("------------------------------------------------------")
 
 
 
-    filtro = ((tabla['id'] <=1_000) & (tabla['score'] > 80)).compute()
+    filtro = ((tabla['id'] <=1_000_000) & (tabla['score'] < 80)).compute()
     start = time.perf_counter()
     tabla2 = tabla.filter(filtro)
     stop = time.perf_counter()
@@ -579,4 +587,4 @@ if __name__ == "__main__":
 
     print(f"Comprimido: {total_comprimido / 1024 ** 2:.2f} MB")
     print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
-    print(f"Ratio: {total_comprimido / total_sin_comprimir:.2%}")
+    print(f"Ratio: {total_sin_comprimir/total_comprimido:.2}x")
