@@ -488,15 +488,18 @@ class CTable(Generic[RowT]):
                 index = self._n_rows + ind
             else:
                 raise IndexError("list index out of range")
-
+            ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            index = int(ultimas_validas[index])
             return [col[index][()] for col in self._cols.values()]
 
         if isinstance(ind, slice):
             indices = range(*ind.indices(self._n_rows))
-            return [self._run_row_logic(i) for i in indices]
+            ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            return [self._run_row_logic(int(ultimas_validas[i])) for i in indices]
 
         if isinstance(ind, (list, tuple)) or (isinstance(ind, Iterable) and not isinstance(ind, str)):
-            return [self._run_row_logic(i) for i in ind]
+            ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            return [self._run_row_logic(int(ultimas_validas[i])) for i in ind]
 
         raise TypeError(
             f"Invalid argument type. Expected 'int' or 'slice', "
@@ -600,4 +603,4 @@ if __name__ == "__main__":
     print(tabla2.head(10))
 
 
-    print(tabla2.row[0:10])
+    print(tabla2.row[0:100])
