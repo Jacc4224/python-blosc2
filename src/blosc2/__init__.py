@@ -608,7 +608,7 @@ from .ndarray import (
 )
 
 
-from blosc2.ctable import CTable
+from .ctable import CTable
 
 
 __all__ = [  # noqa : RUF022

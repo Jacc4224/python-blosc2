@@ -1,90 +1,100 @@
 import time
 import numpy as np
 import blosc2
+import pandas as pd
 from pydantic import BaseModel, Field
 from typing import Annotated
+import psutil
 
-# --- 1. Definir el Modelo ---
+# --- 1. Tu RowModel COMPLEJO ---
+class NumpyDtype:
+    def __init__(self, dtype):
+        self.dtype = dtype
+
 class RowModel(BaseModel):
-    id: int = Field(ge=0)
-    name: bytes = Field(default=b"unknown", max_length=10)
-    score: float
+    id: Annotated[int, NumpyDtype(np.int64)] = Field(ge=0)
+    c_val: Annotated[complex, NumpyDtype(np.complex128)] = Field(default=0j)
+    score: Annotated[float, NumpyDtype(np.float64)] = Field(ge=0, le=100)
+    active: Annotated[bool, NumpyDtype(np.bool_)] = True
 
 # --- 2. Parámetros ---
-N = 100_000
-row_data = {"id": 1, "name": b"benchmark", "score": 3.14}
-
-print(f"=== BENCHMARK: Ingestión Iterativa ({N} filas) ===\n")
+N = 1_000_000  # 1M filas
+print(f"=== BENCHMARK: 1M Filas COMPLEJAS (Listas de Listas) ===\n")
 
 # ==========================================
-# TEST PANDAS (Baseline)
+# 0. GENERAR DATOS (Lista de listas COMPLEJA)
 # ==========================================
-import pandas as pd
+print("--- Generando 1M filas complejas ---")
+t0 = time.time()
+data_list = []
+for i in range(N):
+    data_list.append([
+        i,                                    # id: int64
+        complex(i*0.1, i*0.01),              # c_val: complex128
+        10.0 + np.sin(i*0.001)*50,           # score: float64
+        (i % 3 == 0)                         # active: bool
+    ])
+t_gen = time.time() - t0
+print(f"Tiempo generación: {t_gen:.4f} s")
+print(f"Lista ocupa: {len(data_list):,} filas\n")
 
-print("--- 1. PANDAS (Lista -> DataFrame) ---")
+# ==========================================
+# 1. PANDAS: Lista compleja -> DataFrame
+# ==========================================
+print("--- 1. PANDAS (Creación) ---")
+gc_pandas = psutil.Process().memory_info().rss / (1024**2)
 t0 = time.time()
 
-buffer_list = []
-for _ in range(N):
-    buffer_list.append(row_data)
+df = pd.DataFrame(data_list, columns=['id', 'c_val', 'score', 'active'])
 
-df = pd.DataFrame(buffer_list)
-t_pandas = time.time() - t0
+t_pandas_create = time.time() - t0
+gc_pandas_after = psutil.Process().memory_info().rss / (1024**2)
+mem_pandas = gc_pandas_after - gc_pandas
+print(f"Tiempo creación:  {t_pandas_create:.4f} s")
+print(f"Memoria usada:    {mem_pandas:.2f} MB")
 
-print(f"Tiempo Total: {t_pandas:.4f} s")
-mem_pandas = df.memory_usage(deep=True).sum() / (1024**2)
-print(f"Memoria RAM:  {mem_pandas:.2f} MB")
-
+# Pandas head(1000)
+t0 = time.time()
+df_head = df.head(1000)
+t_pandas_head = time.time() - t0
+print(f"Tiempo head(1000): {t_pandas_head:.6f} s\n")
 
 # ==========================================
-# TEST BLOSC2 (Estrategia 1: extend() con lista)
+# 2. BLOSC2 Oficial: extend() con conversión
 # ==========================================
-print("\n--- 2. BLOSC2 (extend con lista de dicts) ---")
+print("--- 2. BLOSC2 Oficial (extend + conversión Pydantic) ---")
+gc_blosc = psutil.Process().memory_info().rss / (1024**2)
 t0 = time.time()
 
-# Acumular en lista de diccionarios
-buffer_list_2 = []
-for _ in range(N):
-    buffer_list_2.append(row_data)
-
-# Crear CTable vacía e insertar todo de golpe
+# ❌ Blosc2 oficial REQUIERE conversión a modelos
 ctable = blosc2.CTable(RowModel)
-ctable.extend(buffer_list_2)
+ctable.extend(data_list)
 
-t_blosc_extend = time.time() - t0
-print(f"Tiempo Total: {t_blosc_extend:.4f} s")
+t_blosc_create = time.time() - t0
+gc_blosc_after = psutil.Process().memory_info().rss / (1024**2)
+mem_blosc = gc_blosc_after - gc_blosc
+mem_compressed = sum(col.schunk.nbytes for col in ctable._cols.values()) / (1024**2)
+print(f"Tiempo creación:  {t_blosc_create:.4f} s")
+total_comprimido = sum(col.cbytes for col in ctable._cols.values()) + ctable._valid_rows.cbytes
+total_sin_comprimir = sum(col.nbytes for col in ctable._cols.values()) + ctable._valid_rows.nbytes
 
-mem_blosc_extend = sum(col.schunk.nbytes for col in ctable._cols.values()) / (1024**2)
-print(f"Memoria (Compr): {mem_blosc_extend:.2f} MB")
+print(f"Comprimido: {total_comprimido / 1024 ** 2:.2f} MB")
+print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
+print(f"Ratio: {total_sin_comprimir/total_comprimido:.2}x")
 
-
-# ==========================================
-# TEST BLOSC2 (Estrategia 2: Append iterativo + resize geométrico)
-# ==========================================
-# Esta es la estrategia OPTIMIZADA que discutimos (resize geométrico)
-print("\n--- 3. BLOSC2 (append iterativo optimizado) ---")
 t0 = time.time()
+ctable_head = ctable.head(1000)
+t_blosc_head = time.time() - t0
+print(f"Tiempo head(1000): {t_blosc_head:.6f} s\n")
 
-ctable2 = blosc2.CTable(RowModel)
-
-# Simulamos el bucle iterativo "uno a uno"
-# En tu código optimizado, esto sería tu método append() con resize geométrico
-for _ in range(N):
-    ctable2.append(row_data)
-
-t_blosc_append = time.time() - t0
-print(f"Tiempo Total: {t_blosc_append:.4f} s")
-
-mem_blosc_append = sum(col.schunk.nbytes for col in ctable2._cols.values()) / (1024**2)
-print(f"Memoria (Compr): {mem_blosc_append:.2f} MB")
 
 
 # ==========================================
-# CONCLUSIONES
+# 🏆 RESUMEN COMPLETO
 # ==========================================
-print("\n--- RESUMEN ---")
-print(f"Pandas (lista->df):       {t_pandas:.4f} s")
-print(f"Blosc2 (extend):          {t_blosc_extend:.4f} s ({t_pandas/t_blosc_extend:.2f}x {'más rápido' if t_blosc_extend < t_pandas else 'más lento'})")
-print(f"Blosc2 (append iterativo):{t_blosc_append:.4f} s ({t_pandas/t_blosc_append:.2f}x {'más rápido' if t_blosc_append < t_pandas else 'más lento'})")
-
-print(f"\nCompresión Blosc2 vs Pandas: {mem_blosc_extend / mem_pandas * 100:.2f}% del tamaño")
+print("═" * 80)
+print("🥇 BENCHMARK 1M FILAS COMPLEJAS (int64+complex128+float64+bool)")
+print("═" * 80)
+print(f"{'MÉTRICA':<22} {'PANDAS':>12} {'BLOsc2*':>10} {'TU CTable':>12}")
+print(f"{'':<22} {'':>12} {'*+Pydantic':>10} {'¡Directo!':>12}")
+print("-" * 80)

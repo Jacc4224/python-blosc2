@@ -5,17 +5,24 @@
 # This source code is licensed under a BSD-style license (found in the
 # LICENSE file in the root directory of this source tree)
 #######################################################################
+
+"""Imports para CTable"""
+
 from __future__ import annotations
 from collections.abc import Iterable
 
 from dataclasses import Field
-from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar, List
 
 import numpy as np
+from line_profiler import profile
+from numpy.ma.core import append
 from pydantic import BaseModel, Field, create_model, ValidationError
 
 import blosc2
+from blosc2 import concat, compute_chunks_blocks, where
 
+""" Imports extra """
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -31,18 +38,24 @@ class MaxLen:
     def __init__(self, length: int):
         self.length = int(length)
 
-
+"""
 class RowModel(BaseModel):
+    id: Annotated[int, NumpyDtype(np.int64)] = Field(ge=0)
+    c_val: Annotated[complex, NumpyDtype(np.complex128)] = Field(default=0j)
+    score: Annotated[float, NumpyDtype(np.float64)] = Field(ge=0, le=100)
+    active: Annotated[bool, NumpyDtype(np.bool_)] = True
+
+'''class RowModel(BaseModel):
     id: Annotated[int, NumpyDtype(np.int16)] = Field(ge=0)
     name: Annotated[str, MaxLen(10)] = Field(default="unknown")
     # name: Annotated[bytes, MaxLen(10)] = Field(default=b"unknown")
     score: Annotated[float, NumpyDtype(np.float32)] = Field(ge=0, le=100)
-    active: Annotated[bool, NumpyDtype(np.bool_)] = True
+    active: Annotated[bool, NumpyDtype(np.bool_)] = True'''
 
 class RowModel2(BaseModel):
     id: Annotated[int, NumpyDtype(np.int16)] = Field(ge=0)
     #name: Annotated[str, MaxLen(10)] = Field(default="unknown")
-    name: Annotated[bytes, MaxLen(10)] = Field(default=b"unknown")
+    name: Annotated[bytes, MaxLen(10)] = Field(default=b"unknown")"""
 
 
 
@@ -58,17 +71,22 @@ class _RowIndexer:
 
 class CTable(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data: dict[str, Any] | Iterable[dict[str,Any]] | RowT = None, key: str = None) -> None:
+    def __init__(self, row_type: type[RowT], new_data = None, key: str = None, expected_size: int = 1_048_576, compact: bool = False) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
-        self._capacity: int = 1
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
+        self._col_names = []
         self.row = _RowIndexer(self)
         self._key: str = key
+        self._key_set: set[Any] = set()
+        self.auto_compact = compact
+        c, b = compute_chunks_blocks((expected_size,))
+        self._valid_rows = blosc2.zeros(shape=(expected_size,), dtype = np.bool_ , chunks=c, blocks=b)
 
 
         for name, field in row_type.model_fields.items():
+            self._col_names.append(name)
             origin = getattr(field.annotation, "__origin__", field.annotation)
 
             # We need to check for other posibilities...
@@ -114,13 +132,25 @@ class CTable(Generic[RowT]):
             final_width = max(len(name), display_width)
             self._col_widths[name] = final_width        # Usefull in __str__
 
-            self._cols[name] = blosc2.zeros(shape=1, dtype=dt)
+            self._cols[name] = blosc2.zeros(shape=(expected_size,), dtype=dt, chunks=c, blocks=b)
 
         if new_data is not None:
-            if isinstance(new_data, Iterable) and not isinstance(new_data, dict):
-                self.extend(new_data)
-            else:
+            is_append = False
+
+            if isinstance(new_data, (np.void, np.record)):
+                is_append = True
+            elif isinstance(new_data, np.ndarray):
+                if new_data.dtype.names is not None and new_data.ndim == 0:
+                    is_append = True
+            elif isinstance(new_data, list) and len(new_data) > 0:
+                first_elem = new_data[0]
+                if isinstance(first_elem, (str, bytes, int, float, bool, complex)):
+                    is_append = True
+
+            if is_append:
                 self.append(new_data)
+            else:
+                self.extend(new_data)
 
     def __str__(self):
         retval = []
@@ -137,46 +167,213 @@ class CTable(Generic[RowT]):
 
 
         # We print the rows
-        for i in range(self._n_rows):
+
+        """Change this. Use where"""
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+
+        for j in real_poss:
             for name in self._cols.keys():
-                retval.append(f"{self._cols[name][i]:^{self._col_widths[name]}}")
+                retval.append(f"{self._cols[name][j]:^{self._col_widths[name]}}")
                 retval.append(f" |")
             retval.append("\n")
-            for i in range(cont):
+            for _ in range(cont):
                 retval.append("-")
             retval.append("\n")
         return "".join(retval)
 
-    def head(self, head: int = 1) -> None:
-        if not isinstance(head, int):
-            raise TypeError("tail must be an integer")
+    def __len__(self):
+        return self._n_rows
 
-        start = 0
-        end = min(self._n_rows, head)
+    def head(self, N: int = 5) -> CTable:
+        '''
+        # Alternative code, slowe with big data
+        if n <= 0:
+            return CTable(self._row_type, compact=self.auto_compact)
 
-        row_to_add = self.row[start:end]
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        n_take = min(n, self._n_rows)
 
-        retval = CTable(self._row_type, row_to_add)
+        retval = CTable(self._row_type, compact=self.auto_compact)
+        retval._n_rows = n_take
+        retval._valid_rows[:n_take] = True
+
+        for k in self._cols.keys():
+            retval._cols[k][:n_take] = self._cols[k][real_poss[:n_take]]
+
+        return retval'''
+
+        arr = self._valid_rows
+        count = 0
+        chunk_size = arr.chunks[0]
+        pos_N_true = -1
+        if (N<=0):
+            return CTable(self._row_type, compact=self.auto_compact)
+        for info in arr.iterchunks_info():
+            actual_size = min(chunk_size, arr.shape[0] - info.nchunk * chunk_size)
+            chunk_start = info.nchunk * chunk_size
+
+            # All False without decompressing → skip
+            if info.special == blosc2.SpecialValue.ZERO:
+                continue
+
+            # Repeated value → check if True or False
+            if info.special == blosc2.SpecialValue.VALUE:
+                val = np.frombuffer(info.repeated_value, dtype=arr.dtype)[0]
+                if not val:
+                    continue  # all False, skip
+                # All True: target is at offset (N - count - 1) within the chunk
+                if count + actual_size < N:
+                    count += actual_size
+                    continue
+                pos_N_true = chunk_start + (N - count - 1)
+                break
+
+            # General case: decompress only this chunk
+            chunk_data = arr[chunk_start: chunk_start + actual_size]
+
+            n_true = int(np.count_nonzero(chunk_data))
+            if count + n_true < N:
+                count += n_true
+                continue
+
+            # The N-th True is in this chunk
+            pos_N_true = chunk_start + int(np.flatnonzero(chunk_data)[N - count - 1])
+            break
+
+        if pos_N_true == -1:
+            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+            return retval
+
+        retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+        retval._n_rows = min(self._n_rows, N)
+        if pos_N_true < len(self._valid_rows)//2:
+            mask_arr = blosc2.zeros(shape=len(arr), dtype=np.bool_)
+            mask_arr[:pos_N_true+1] = True
+        else:
+            mask_arr = blosc2.ones(shape=len(arr), dtype=np.bool_)
+            mask_arr[pos_N_true+1:] = False
+
+        mask_arr = (mask_arr & self._valid_rows).compute()
+        retval._valid_rows = mask_arr
         return retval
 
-    def tail(self, tail: int = 1) -> None:
-        if not isinstance(tail, int):
-            raise TypeError("tail must be an integer")
+    '''def tail(self, n: int = 5) -> CTable:
+        if n <= 0:
+            return CTable(self._row_type)
 
-        end = self._n_rows
-        start = max(0, self._n_rows-tail)
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        start = max(0, self._n_rows - n)
+        n_take = min(n, self._n_rows)
 
-        row_to_add = self.row[start:end]
+        retval = CTable(self._row_type, expected_size=len(self._valid_rows))
+        retval._n_rows = n_take
+        retval._valid_rows[:n_take] = True
 
-        retval = CTable(self._row_type, row_to_add)
+        for k in self._cols.keys():
+            rp = real_poss[start:start + n_take]
+            retval._cols[k][:n_take] = self._cols[k][rp]
+
+        return retval'''
+    import blosc2
+    import numpy as np
+
+    def tail(self, N: int = 5) -> 'CTable':
+        if N <= 0:
+            # If N is 0 or negative, return an empty table
+            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+            retval._valid_rows = blosc2.zeros(shape=len(self._valid_rows), dtype=np.bool_)
+            retval._n_rows = 0
+            return retval
+
+        arr = self._valid_rows
+        count = 0
+        chunk_size = arr.chunks[0]
+        pos_N_true = -1
+
+        # Convert to list to iterate chunks in reverse order (metadata only, ~0 memory)
+        for info in reversed(list(arr.iterchunks_info())):
+            actual_size = min(chunk_size, arr.shape[0] - info.nchunk * chunk_size)
+            chunk_start = info.nchunk * chunk_size
+
+            # All False without decompressing → skip
+            if info.special == blosc2.SpecialValue.ZERO:
+                continue
+
+            # Repeated value → check if True or False
+            if info.special == blosc2.SpecialValue.VALUE:
+                val = np.frombuffer(info.repeated_value, dtype=arr.dtype)[0]
+                if not val:
+                    continue  # all False, skip
+
+                # All True: target is at offset 'actual_size - (N - count)' from chunk start
+                if count + actual_size < N:
+                    count += actual_size
+                    continue
+                pos_N_true = chunk_start + actual_size - (N - count)
+                break
+
+            # General case: decompress only this chunk
+            chunk_data = arr[chunk_start: chunk_start + actual_size]
+
+            n_true = int(np.count_nonzero(chunk_data))
+            if count + n_true < N:
+                count += n_true
+                continue
+
+            # The N-th True from the end is in this chunk
+            # We use negative indexing [-(N - count)] to get elements from the back
+            pos_N_true = chunk_start + int(np.flatnonzero(chunk_data)[-(N - count)])
+            break
+
+        if pos_N_true == -1:
+            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+            return retval
+
+        # Create the returning CTable
+        retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+        retval._n_rows = min(self._n_rows, N)
+
+        # Mask creation logic reversed: keep everything from pos_N_true to the end
+        if pos_N_true > len(arr) // 2:
+            # We keep a small tail (less than half the array): start with zeros
+            mask_arr = blosc2.zeros(shape=len(arr), dtype=np.bool_)
+            mask_arr[pos_N_true:] = True
+        else:
+            # We keep a large tail (more than half the array): start with ones
+            mask_arr = blosc2.ones(shape=len(arr), dtype=np.bool_)
+            if pos_N_true > 0:
+                mask_arr[:pos_N_true] = False
+
+        # Compute intersection with existing valid rows
+        mask_arr = (mask_arr & self._valid_rows).compute()
+        retval._valid_rows = mask_arr
         return retval
 
     def __getitem__(self, s: str):
         return self._cols[s] if s in self._cols else None
 
     def __getattr__(self, s: str):
-        return self[s] if s in self._cols else super().__getattribute__(s)
+        return self._cols[s] if s in self._cols else super().__getattribute__(s)
 
+    def compact(self):
+        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        start = 0
+        block_size= self._valid_rows.blocks[0]
+        end = min(block_size, self._n_rows)
+        while start < end:
+            for k, v in self._cols.items():
+                v[start:end] = v[real_poss[start:end]]
+            start += block_size
+            end = min(end + block_size, self._n_rows)
+
+        self._valid_rows[:self._n_rows] = True
+        self._valid_rows[self._n_rows:] = False
+        while blosc2.count_nonzero(self._valid_rows) < len(self._valid_rows)//2:
+            for k, v in self._cols.items():
+                v.resize((len(self._valid_rows)//2,))
+            self._valid_rows.resize((len(self._valid_rows)//2,))
+
+    # Revisar
     def __setitem__(self, key, value):
         if key not in self._cols.keys():
             raise KeyError(f"Key {key} not in ColumnTable")
@@ -241,267 +438,201 @@ class CTable(Generic[RowT]):
         """
         ...
 
-    def append(self, data: dict[str, Any] | RowT) -> None:
-        try:
-            row = data if isinstance(data, self._row_type) else self._row_type(**data)
-        except (TypeError, ValidationError) as e:
-            raise TypeError(
-                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
-                f"Details: {e}"
-            ) from e
+    def append(self, data: list | np.void | np.ndarray) -> None:
+        is_list = isinstance(data, (list, tuple))
+        col_values = list(self._cols.values())
+        col_names = self._col_names
 
-        if self._n_rows > 0:
-            if self._key is not None:
-                key = data[self._key]
-                if key in self._key_set:
-                    raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
-                self._key_set.add(key)
+        if isinstance(data, dict):
+            raise TypeError("Dictionaries are not supported in append.")
 
-            self._capacity += 1
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+        if is_list and len(data) != len(col_values):
+            raise ValueError(f"Expected {len(col_values)} values, received {len(data)}")
 
-        for k, v in row.model_dump().items():
-            self._cols[k][self._n_rows] = v
+        if is_list:
+            for i, val in enumerate(data):
+                target_dtype = col_values[i].dtype
+                try:
+                    np.array(val, dtype=target_dtype)
+                except (ValueError, TypeError):
+                    raise TypeError(
+                        f"Value '{val}' is not compatible with column '{col_names[i]}' of type {target_dtype}")
+        else:
+            for name, arr in self._cols.items():
+                try:
+                    val = data[name]
+                except (IndexError, KeyError, ValueError):
+                    raise ValueError(f"Input data does not contain required field '{name}'")
+
+                try:
+                    np.array(val, dtype=arr.dtype)
+                except (ValueError, TypeError):
+                    raise TypeError(f"Value '{val}' in field '{name}' is not compatible with type {arr.dtype}")
+
+        ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
+        if pos >= len(self._valid_rows):
+            c = len(self._valid_rows)
+            for k,v in self._cols.items():
+                v.resize((c * 2,))
+            self._valid_rows.resize((c * 2,))
+
+        if is_list:
+            for i, col_array in enumerate(col_values):
+                col_array[pos] = data[i]
+        else:
+            for name, col_array in self._cols.items():
+                col_array[pos] = data[name]
+        self._valid_rows[pos] = True
 
         self._n_rows += 1
 
     def delete(self, pos: int | list[int]) -> None:
-        if isinstance(pos, list):
-            if not isinstance(pos[0], int):
-                raise TypeError("Position must be an integer or a list of integers")
-            desp = 1
-            for i in range(min(pos), self._n_rows-len(pos)):
-                for v in self._cols.values():
-                    while(i+desp in pos):
-                        desp += 1
-                    v[i] = v[i + desp]
-            self._capacity = self._capacity - len(pos)
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-            self._n_rows = self._n_rows - len(pos)
-        elif isinstance(pos, int):
-            if pos > self._n_rows:
-                raise IndexError("Index out of range")
-            elif pos < 0:
-                pos = self._n_rows + pos
 
-            for i in range(pos, self._n_rows-1):
-                for v in self._cols.values():
-                    v[i] = v[i+1]
-            self._capacity = self._capacity -1
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-            self._n_rows = self._n_rows-1
+        if isinstance(pos, list) or isinstance(pos, int):
+            if isinstance(pos, list) and not isinstance(pos[0], int):
+                raise TypeError("Position must be an integer or a list of integers")
+            elif isinstance(pos, int) and pos > self._n_rows:
+                raise IndexError("Index out of range")
+            elif isinstance(pos, int) and pos < 0:
+                pos = self._n_rows + pos
+            pos  = np.array(pos)
+            pos.sort()
+
+            real_pos = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+
+            aux = real_pos[pos]
+            self._valid_rows[aux]= False
+
+            self._n_rows = blosc2.count_nonzero(self._valid_rows)
 
         else:
             raise TypeError("Position must be an integer or a list of integers")
 
-    def _appendExtend(self, data: dict[str, Any] | RowT) -> None:
-        try:
-            row = data if isinstance(data, self._row_type) else self._row_type(**data)
-        except (TypeError, ValidationError) as e:
-            raise TypeError(
-                f"Data provided does not match the expected row schema '{self._row_type.__name__}'.\n"
-                f"Details: {e}"
-            ) from e
+    def extend(self, data: list | CTable | Any) -> None:
+        ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
 
-        if self._n_rows > 0:
-            if self._key is not None:
-                key = data[self._key]
-                for v in self._cols[self._key]:
-                    if v == key:
-                        raise KeyError(f"Key already exists in column {self._key} with value {data[self._key]}")
+        current_col_names = self._col_names
+        columns_to_insert = []
+        new_nrows = 0
 
-        # if error the table should be resized, otherwise empty or default rows.
-        # continue with extend and resize one row?
-        # stop extend and rsize all empty rows?
-
-        for k, v in row.model_dump().items():
-            self._cols[k][self._n_rows] = v
-
-        self._n_rows += 1
-
-    def extend(self, rows: Iterable[dict[str, Any] | RowT] | CTable) -> None:
-        if not (isinstance(rows, Iterable) or isinstance(rows, dict) or isinstance(rows, CTable)):
-            raise TypeError("Expected an iterable of rows or blosc2.CTable.")
-        if isinstance(rows, CTable):
-            if rows._row_type != self._row_type:
-                raise TypeError("Tables are not the same type.")
-
-            self._capacity = self._capacity + rows.nrows
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
-
-            for k in rows._cols.keys():
-                self._cols[k][self._n_rows:] = rows._cols[k][:]
-            self._n_rows += rows.nrows
-
+        if hasattr(data, "_cols") and hasattr(data, "_n_rows"):
+            for name in current_col_names:
+                col = data._cols[name][:data._n_rows]
+                columns_to_insert.append(col)
+            new_nrows = data._n_rows
         else:
-            if self._n_rows > 0:
-                self._capacity += len(rows)
+            if isinstance(data, np.ndarray) and data.dtype.names is not None:
+                for name in current_col_names:
+                    columns_to_insert.append(data[name])
+                new_nrows = len(data)
             else:
-                self._capacity += len(rows)-1
+                columns_to_insert = list(zip(*data))
+                new_nrows = len(data)
 
-            for col_array in self._cols.values():
-                col_array.resize((self._capacity,))
+        processed_cols = []
+        for i, raw_col in enumerate(columns_to_insert):
+            target_dtype = self._cols[current_col_names[i]].dtype
+            b2_arr = blosc2.asarray(raw_col, dtype=target_dtype)
+            processed_cols.append(b2_arr)
 
-            for r in rows:
-                self._appendExtend(r)
+        end_pos = start_pos + new_nrows
 
+        if self.auto_compact and end_pos >= len(self._valid_rows):
+            self.compact()
+            ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+            start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
+            end_pos = start_pos + new_nrows
+
+        while end_pos > len(self._valid_rows):
+            c = len(self._valid_rows)
+            for name in current_col_names:
+                self._cols[name].resize((c*2,))
+            self._valid_rows.resize((c*2,))
+
+
+
+
+        # Do this per chunks
+        for j, name in enumerate(current_col_names):
+            self._cols[name][start_pos:end_pos] = processed_cols[j][:]
+
+        self._valid_rows[start_pos:end_pos] = True
+        self._n_rows = blosc2.count_nonzero(self._valid_rows)
+
+    @profile
     def filter(self, expr_result) -> CTable:
-        filtro = None
-        if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and expr_result.dtype == np.bool_):
-            raise TypeError(
-                f"Expected a boolean 'blosc2.NDArray' or 'blosc2.LazyExpr', "
-                f"but got type '{type(expr_result).__name__}' "
-                f"with dtype '{getattr(expr_result, 'dtype', 'N/A')}'."
-            )
-        if isinstance(expr_result, blosc2.LazyExpr):
-            filtro = expr_result.compute()
-        elif isinstance(expr_result, blosc2.NDArray) or (expr_result.dtype != np.bool_):
-            filtro = expr_result
+        if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and
+                (getattr(expr_result, 'dtype', None) == np.bool_)):
+            raise TypeError(f"Expected boolean blosc2.NDArray or LazyExpr, got {type(expr_result).__name__}")
 
+        filter = expr_result.compute() if isinstance(expr_result, blosc2.LazyExpr) else expr_result
 
-        retval = CTable(self._row_type)
-        if filtro is not None and len(filtro) >= self._n_rows:
-            for i in range(self._n_rows):
-                if filtro[i]:
-                    retval.append(self.row[i])
-        else:
-            raise ValueError(
-                f"Filter length ({len(filtro)}) does not match the number of rows ({self._n_rows})."
-            )
+        target_len = len(self._valid_rows)
+
+        if len(filter) > target_len:
+            filter = filter[:target_len]
+        elif len(filter) < target_len:
+            padding = blosc2.zeros(target_len, dtype=np.bool_)
+            padding[:len(filter)] = filter[:]
+            filter = padding
+
+        filter = (filter & self._valid_rows).compute()
+        new_nrows = blosc2.count_nonzero(filter)
+
+        retval = CTable(self._row_type, expected_size=target_len, compact=self.auto_compact)
+
+        for k, v in retval._cols.items():
+            v[:] = self._cols[k][:]
+
+        retval._valid_rows = filter
+        retval._n_rows = int(new_nrows)
+        if self.auto_compact:
+            retval.compact()
+
         return retval
 
-    def _run_row_logic(self, ind: int | slice | str) -> RowT | list[RowT]| None:
+    @property
+    def _valid_pos(self):
+        """Cache único: índices reales de filas válidas (lista int)"""
+        if not hasattr(self, '_cached_valid_pos'):
+            self._cached_valid_pos = np.flatnonzero(self._valid_rows).tolist()
+        return self._cached_valid_pos
 
+    def _run_row_logic(self, ind: int | slice | str | Iterable) -> list | list[list]:
         if isinstance(ind, str):
-            try:
-                parts = [p.strip() for p in ind.split(':')]
-                if len(parts) > 3 or len(parts) < 2:
-                    raise ValueError
+            parts = [p.strip() for p in ind.split(':')]
+            if len(parts) > 3 or len(parts) < 2: raise ValueError
+            slice_args = [int(p) if p else None for p in parts]
+            return self._run_row_logic(slice(*slice_args))
 
-                slice_args = [int(p) if p else None for p in parts]
-
-                return self._run_row_logic(slice(*slice_args))
-
-            except ValueError:
-                raise ValueError(
-                    f"Invalid slice string format: '{ind}'. Expected format 'start:stop' or 'start:stop:step' with integers.")
+        valid_pos = self._valid_pos  # O(1) cache
 
         if isinstance(ind, int):
-            if 0 <= ind < self._n_rows:
-                index: int = ind
-            elif -self._n_rows <= ind < 0:
-                index: int = self._n_rows + ind
-            else:
-                raise IndexError("list index out of range")
+            lidx = ind if ind >= 0 else self._n_rows + ind
+            if not 0 <= lidx < self._n_rows: raise IndexError("out of range")
+            ridx = valid_pos[lidx]
+            return [col[int(ridx)][()] for col in self._cols.values()]
 
-            data = {}
-            for name, col in self._cols.items():
-                arr_val = col[index]
-                data[name] = arr_val[()]
-            '''if hasattr(arr_val, 'item'):
-                    data[name] = arr_val.item()
-                else:
-                    data[name] = arr_val'''
-            return self._row_type(**data)
+        elif isinstance(ind, slice):
+            lindices = range(*ind.indices(self._n_rows))  # Índices lógicos
+            real_indices = [valid_pos[i] for i in lindices]  # Vectorial
+            # Fancy indexing blosc2 (rápido!)
+            return [[col[int(r)][()] for r in real_indices] for col in self._cols.values()]
 
+        elif isinstance(ind, (list, tuple)):
+            lindices = [int(i) if i >= 0 else self._n_rows + int(i) for i in ind]
+            real_indices = [valid_pos[i] for i in lindices if 0 <= i < self._n_rows]
+            return [[col[int(r)][()] for r in real_indices] for col in self._cols.values()]
 
-        if isinstance(ind, slice):
-            indices = range(*ind.indices(self._n_rows))
-            return [self._run_row_logic(i) for i in indices]
-
-        raise  TypeError(
-        f"Invalid argument type. Expected 'int' or 'slice', "
-        f"but got '{type(ind).__name__}'."
-        )
-
-
-
+        raise TypeError(f"Unsupported: {type(ind)}")
 
     """Save y load por revisar: ha habido cambios como _key"""
 
     def save(self, urlpath: str, group: str = "table") -> None:
-        """
-        Persist columns into a single TreeStore container.
-        Each column is stored under a group / colname.
-        """
-        with blosc2.TreeStore(urlpath, mode="w") as ts:
-            arrays = self._cols
-            for name, arr in arrays.items():
-                node_path = f"{group}/{name}"
-                # Store as compressed NDArray inside the tree
-                print(f"Storing {name} with shape {arr[:self._n_rows].shape} and dtype {arr.dtype} in {node_path}")
-                ts[node_path] = arr[:self._n_rows]
+        ...
 
     @classmethod
     def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> CTable:
-        with blosc2.TreeStore(urlpath, mode="r") as ts:
-            keys = list(ts.keys()) if hasattr(ts, "keys") else []
-            prefix = f"/{group}/" if not group.startswith("/") else f"{group}/"
-            field_names = []
-            for k in keys:
-                k_norm = f"/{k.strip('/')}"
-                if k_norm.startswith(prefix):
-                    field_names.append(k_norm[len(prefix):])
-
-            field_names.sort()
-
-            b2_arrays: dict[str, blosc2.NDArray] = {}
-            annotations: dict[str, Any] = {}
-            defaults: dict[str, Any] = {}
-            loaded_nrows = 0
-
-            for field in field_names:
-                node_path = f"{group}/{field}"
-                stored_array = ts[node_path]
-                b2_arr = blosc2.asarray(stored_array)
-                b2_arrays[field] = b2_arr
-
-                if loaded_nrows == 0 and b2_arr.shape[0] > 0:
-                    loaded_nrows = b2_arr.shape[0]
-
-                if row_type is None:
-                    dt = b2_arr.dtype
-                    kind = dt.kind
-
-                    if kind == "U":
-                        char_size = np.dtype("U1").itemsize
-                        max_len = dt.itemsize // char_size
-                        annotations[field] = Annotated[str, MaxLen(int(max_len))]
-                        defaults[field] = Field(default="")
-                    elif kind == "S":
-                        max_len = dt.itemsize
-                        annotations[field] = Annotated[bytes, MaxLen(int(max_len))]
-                        defaults[field] = Field(default=b"")
-                    elif kind in ("i", "u"):
-                        annotations[field] = Annotated[int, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0)
-                    elif kind == "f":
-                        annotations[field] = Annotated[float, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0.0)
-                    elif kind == "c":
-                        annotations[field] = Annotated[complex, NumpyDtype(dt)]
-                        defaults[field] = Field(default=0j)
-                    elif kind == "b":
-                        annotations[field] = Annotated[bool, NumpyDtype(dt)]
-                        defaults[field] = Field(default=False)
-                    else:
-                        annotations[field] = Annotated[Any, NumpyDtype(dt)]
-                        defaults[field] = Field(default=None)
-
-            if row_type is None:
-                model_fields = {}
-                for name, ann in annotations.items():
-                    model_fields[name] = (ann, defaults.get(name, ...))
-                row_type = create_model("InferredRowModel", __base__=BaseModel, **model_fields)
-
-            tbl = cls(row_type)
-
-            tbl._cols = b2_arrays
-            tbl._n_rows = loaded_nrows
-            tbl._capacity = loaded_nrows
-            return tbl
-
+        ...
