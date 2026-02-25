@@ -257,26 +257,6 @@ class CTable(Generic[RowT]):
         retval._valid_rows = mask_arr
         return retval
 
-    '''def tail(self, n: int = 5) -> CTable:
-        if n <= 0:
-            return CTable(self._row_type)
-
-        real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
-        start = max(0, self._n_rows - n)
-        n_take = min(n, self._n_rows)
-
-        retval = CTable(self._row_type, expected_size=len(self._valid_rows))
-        retval._n_rows = n_take
-        retval._valid_rows[:n_take] = True
-
-        for k in self._cols.keys():
-            rp = real_poss[start:start + n_take]
-            retval._cols[k][:n_take] = self._cols[k][rp]
-
-        return retval'''
-    import blosc2
-    import numpy as np
-
     def tail(self, N: int = 5) -> 'CTable':
         if N <= 0:
             # If N is 0 or negative, return an empty table
@@ -510,6 +490,8 @@ class CTable(Generic[RowT]):
             raise TypeError("Position must be an integer or a list of integers")
 
     def extend(self, data: list | CTable | Any) -> None:
+        if len(data) <=0:
+            return
         ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
         start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
 

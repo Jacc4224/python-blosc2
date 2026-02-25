@@ -18,7 +18,7 @@ class RowModel(BaseModel):
     active: Annotated[bool, NumpyDtype(np.bool_)] = True
 
 # --- 2. Parámetros ---
-N = 1_000_000  # 1M filas
+N = 10_000_000  # 1M filas
 print(f"=== BENCHMARK: 1M Filas COMPLEJAS (Listas de Listas) ===\n")
 
 # ==========================================
@@ -55,7 +55,7 @@ print(f"Memoria usada:    {mem_pandas:.2f} MB")
 
 # Pandas head(1000)
 t0 = time.time()
-df_head = df.head(1000)
+df_head = df.head(N)
 t_pandas_head = time.time() - t0
 print(f"Tiempo head(1000): {t_pandas_head:.6f} s\n")
 
@@ -67,7 +67,7 @@ gc_blosc = psutil.Process().memory_info().rss / (1024**2)
 t0 = time.time()
 
 # ❌ Blosc2 oficial REQUIERE conversión a modelos
-ctable = blosc2.CTable(RowModel)
+ctable = blosc2.CTable(RowModel, expected_size=N)
 ctable.extend(data_list)
 
 t_blosc_create = time.time() - t0
@@ -83,7 +83,7 @@ print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
 print(f"Ratio: {total_sin_comprimir/total_comprimido:.2}x")
 
 t0 = time.time()
-ctable_head = ctable.head(1000)
+ctable_head = ctable.head(N)
 t_blosc_head = time.time() - t0
 print(f"Tiempo head(1000): {t_blosc_head:.6f} s\n")
 
