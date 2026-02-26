@@ -71,22 +71,23 @@ class _RowIndexer:
 
 class CTable(Generic[RowT]):
 
-    def __init__(self, row_type: type[RowT], new_data = None, key: str = None, expected_size: int = 1_048_576, compact: bool = False) -> None:
+    def __init__(self, row_type: type[RowT], new_data = None, expected_size: int = 1_048_576, compact: bool = False) -> None:
         self._row_type = row_type
         self._cols: dict[str, blosc2.NDArray] = {}
         self._n_rows: int = 0
         self._col_widths: dict[str, int] = {}
-        self._col_names = []
+        self.col_names = []
         self.row = _RowIndexer(self)
-        self._key: str = key
-        self._key_set: set[Any] = set()
         self.auto_compact = compact
+        self.base = None
+
+
         c, b = compute_chunks_blocks((expected_size,))
         self._valid_rows = blosc2.zeros(shape=(expected_size,), dtype = np.bool_ , chunks=c, blocks=b)
 
 
         for name, field in row_type.model_fields.items():
-            self._col_names.append(name)
+            self.col_names.append(name)
             origin = getattr(field.annotation, "__origin__", field.annotation)
 
             # We need to check for other posibilities...
@@ -184,6 +185,27 @@ class CTable(Generic[RowT]):
     def __len__(self):
         return self._n_rows
 
+    def view(self, new_valid_rows):
+        if not (isinstance(new_valid_rows, (blosc2.NDArray, blosc2.LazyExpr)) and
+                (getattr(new_valid_rows, 'dtype', None) == np.bool_)):
+            raise TypeError(f"Expected boolean blosc2.NDArray or LazyExpr, got {type(new_valid_rows).__name__}")
+
+        new_valid_rows = new_valid_rows.compute() if isinstance(new_valid_rows, blosc2.LazyExpr) else new_valid_rows
+
+        if len(self._valid_rows) != len(new_valid_rows):
+            raise ValueError()
+
+        retval = CTable(self._row_type, compact=self.auto_compact, expected_size=len(self._valid_rows))
+        retval._cols = self._cols
+        retval._n_rows= blosc2.count_nonzero(new_valid_rows)
+        retval._col_widths= self._col_widths
+        retval.col_names = self.col_names
+        retval.base = self
+        retval._valid_rows = new_valid_rows
+
+        return retval
+
+
     def head(self, N: int = 5) -> CTable:
         '''
         # Alternative code, slowe with big data
@@ -201,13 +223,17 @@ class CTable(Generic[RowT]):
             retval._cols[k][:n_take] = self._cols[k][real_poss[:n_take]]
 
         return retval'''
+        if N <= 0:
+            # If N is 0 or negative, return an empty table
+            retval = self.view(blosc2.zeros(shape=len(self._valid_rows), dtype=np.bool_))
+            return retval
 
         arr = self._valid_rows
         count = 0
         chunk_size = arr.chunks[0]
         pos_N_true = -1
         if (N<=0):
-            return CTable(self._row_type, compact=self.auto_compact)
+            return self.view(blosc2.zeros(shape=len(arr), dtype=np.bool_))
         for info in arr.iterchunks_info():
             actual_size = min(chunk_size, arr.shape[0] - info.nchunk * chunk_size)
             chunk_start = info.nchunk * chunk_size
@@ -241,11 +267,9 @@ class CTable(Generic[RowT]):
             break
 
         if pos_N_true == -1:
-            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+            retval = self.view(self._valid_rows)
             return retval
 
-        retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
-        retval._n_rows = min(self._n_rows, N)
         if pos_N_true < len(self._valid_rows)//2:
             mask_arr = blosc2.zeros(shape=len(arr), dtype=np.bool_)
             mask_arr[:pos_N_true+1] = True
@@ -254,15 +278,12 @@ class CTable(Generic[RowT]):
             mask_arr[pos_N_true+1:] = False
 
         mask_arr = (mask_arr & self._valid_rows).compute()
-        retval._valid_rows = mask_arr
-        return retval
+        return self.view(mask_arr)
 
     def tail(self, N: int = 5) -> 'CTable':
         if N <= 0:
             # If N is 0 or negative, return an empty table
-            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
-            retval._valid_rows = blosc2.zeros(shape=len(self._valid_rows), dtype=np.bool_)
-            retval._n_rows = 0
+            retval = self.view(blosc2.zeros(shape=len(self._valid_rows), dtype=np.bool_))
             return retval
 
         arr = self._valid_rows
@@ -306,12 +327,10 @@ class CTable(Generic[RowT]):
             break
 
         if pos_N_true == -1:
-            retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
+            retval = self.view(self._valid_rows)
             return retval
 
-        # Create the returning CTable
-        retval = CTable(self._row_type, compact=self.auto_compact, new_data=self)
-        retval._n_rows = min(self._n_rows, N)
+
 
         # Mask creation logic reversed: keep everything from pos_N_true to the end
         if pos_N_true > len(arr) // 2:
@@ -324,9 +343,9 @@ class CTable(Generic[RowT]):
             if pos_N_true > 0:
                 mask_arr[:pos_N_true] = False
 
-        # Compute intersection with existing valid rows
+        # Compute intersection with existing valid rows and creating view
         mask_arr = (mask_arr & self._valid_rows).compute()
-        retval._valid_rows = mask_arr
+        retval = self.view(mask_arr)
         return retval
 
     def __getitem__(self, s: str):
@@ -421,7 +440,7 @@ class CTable(Generic[RowT]):
     def append(self, data: list | np.void | np.ndarray) -> None:
         is_list = isinstance(data, (list, tuple))
         col_values = list(self._cols.values())
-        col_names = self._col_names
+        col_names = self.col_names
 
         if isinstance(data, dict):
             raise TypeError("Dictionaries are not supported in append.")
@@ -467,35 +486,31 @@ class CTable(Generic[RowT]):
 
         self._n_rows += 1
 
-    def delete(self, pos: int | list[int]) -> None:
+    def delete(self, ind: int | slice | str | Iterable) -> blosc2.NDArray:
+        valid_rows_np = self._valid_rows[:]
+        true_pos = np.where(valid_rows_np)[0]
 
-        if isinstance(pos, list) or isinstance(pos, int):
-            if isinstance(pos, list) and not isinstance(pos[0], int):
-                raise TypeError("Position must be an integer or a list of integers")
-            elif isinstance(pos, int) and pos > self._n_rows:
-                raise IndexError("Index out of range")
-            elif isinstance(pos, int) and pos < 0:
-                pos = self._n_rows + pos
-            pos  = np.array(pos)
-            pos.sort()
+        if isinstance(ind, Iterable) and not isinstance(ind, (str, bytes)):
+            ind = list(ind)
 
-            real_pos = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
+        false_pos = true_pos[ind]
 
-            aux = real_pos[pos]
-            self._valid_rows[aux]= False
+        new_mask_np = valid_rows_np.copy()
+        new_mask_np[false_pos] = False
 
-            self._n_rows = blosc2.count_nonzero(self._valid_rows)
-
-        else:
-            raise TypeError("Position must be an integer or a list of integers")
+        new_mask = blosc2.asarray(new_mask_np)
+        self._valid_rows = new_mask
+        self._n_rows = blosc2.count_nonzero(self._valid_rows)
 
     def extend(self, data: list | CTable | Any) -> None:
+        if self.base != None:
+            raise TypeError("Cannot extend view.")
         if len(data) <=0:
             return
         ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
         start_pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
 
-        current_col_names = self._col_names
+        current_col_names = self.col_names
         columns_to_insert = []
         new_nrows = 0
 
@@ -544,7 +559,7 @@ class CTable(Generic[RowT]):
         self._n_rows = blosc2.count_nonzero(self._valid_rows)
 
     @profile
-    def filter(self, expr_result) -> CTable:
+    def where(self, expr_result) -> CTable:
         if not (isinstance(expr_result, (blosc2.NDArray, blosc2.LazyExpr)) and
                 (getattr(expr_result, 'dtype', None) == np.bool_)):
             raise TypeError(f"Expected boolean blosc2.NDArray or LazyExpr, got {type(expr_result).__name__}")
@@ -561,56 +576,27 @@ class CTable(Generic[RowT]):
             filter = padding
 
         filter = (filter & self._valid_rows).compute()
-        new_nrows = blosc2.count_nonzero(filter)
 
-        retval = CTable(self._row_type, expected_size=target_len, compact=self.auto_compact)
-
-        for k, v in retval._cols.items():
-            v[:] = self._cols[k][:]
-
-        retval._valid_rows = filter
-        retval._n_rows = int(new_nrows)
-        if self.auto_compact:
-            retval.compact()
-
+        retval = self.view(filter)
         return retval
 
-    @property
-    def _valid_pos(self):
-        """Cache único: índices reales de filas válidas (lista int)"""
-        if not hasattr(self, '_cached_valid_pos'):
-            self._cached_valid_pos = np.flatnonzero(self._valid_rows).tolist()
-        return self._cached_valid_pos
 
-    def _run_row_logic(self, ind: int | slice | str | Iterable) -> list | list[list]:
-        if isinstance(ind, str):
-            parts = [p.strip() for p in ind.split(':')]
-            if len(parts) > 3 or len(parts) < 2: raise ValueError
-            slice_args = [int(p) if p else None for p in parts]
-            return self._run_row_logic(slice(*slice_args))
+    def _run_row_logic(self, ind: int | slice | str | Iterable) -> CTable:
+        valid_rows_np = self._valid_rows[:]
+        true_pos = np.where(valid_rows_np)[0]
 
-        valid_pos = self._valid_pos  # O(1) cache
+        if isinstance(ind, Iterable) and not isinstance(ind, (str, bytes)):
+            ind = list(ind)
 
-        if isinstance(ind, int):
-            lidx = ind if ind >= 0 else self._n_rows + ind
-            if not 0 <= lidx < self._n_rows: raise IndexError("out of range")
-            ridx = valid_pos[lidx]
-            return [col[int(ridx)][()] for col in self._cols.values()]
+        mant_pos = true_pos[ind]
 
-        elif isinstance(ind, slice):
-            lindices = range(*ind.indices(self._n_rows))  # Índices lógicos
-            real_indices = [valid_pos[i] for i in lindices]  # Vectorial
-            # Fancy indexing blosc2 (rápido!)
-            return [[col[int(r)][()] for r in real_indices] for col in self._cols.values()]
+        new_mask_np = np.zeros_like(valid_rows_np, dtype=bool)
+        new_mask_np[mant_pos] = True
 
-        elif isinstance(ind, (list, tuple)):
-            lindices = [int(i) if i >= 0 else self._n_rows + int(i) for i in ind]
-            real_indices = [valid_pos[i] for i in lindices if 0 <= i < self._n_rows]
-            return [[col[int(r)][()] for r in real_indices] for col in self._cols.values()]
+        new_mask = blosc2.asarray(new_mask_np)
+        return self.view(new_mask)
 
-        raise TypeError(f"Unsupported: {type(ind)}")
-
-    """Save y load por revisar: ha habido cambios como _key"""
+    """Save & load are blank"""
 
     def save(self, urlpath: str, group: str = "table") -> None:
         ...
@@ -618,3 +604,7 @@ class CTable(Generic[RowT]):
     @classmethod
     def load(cls, urlpath: str, group: str = "table", row_type: type[RowT] | None = None) -> CTable:
         ...
+
+    """
+    tabla.where(condicion).operacion(col1 = col1+1)
+    """

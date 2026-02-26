@@ -306,7 +306,7 @@ def test_create_from_filtered_ctable():
     """Create CTable from another filtered CTable."""
     base_table = CTable(RowModel, new_data=MEDIUM_DATA)
     # Filter rows where active == True
-    filtered = base_table.filter(base_table.active == True)
+    filtered = base_table.where(base_table.active == True)
 
     new_table = CTable(RowModel, new_data=filtered)
     assert len(new_table) == len(filtered)
