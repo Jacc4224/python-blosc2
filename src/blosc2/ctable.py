@@ -70,23 +70,26 @@ class _RowIndexer:
 
 
 class Column:
-    """Vista de columna optimizada que respeta la máscara booleana."""
-
     def __init__(self, table: 'CTable', col_name: str):
-        self._raw_col = table._cols[col_name]
-        self._valid_rows = table._valid_rows
+        self._table = table
+        self._col_name = col_name
+
+    @property
+    def _raw_col(self):
+        return self._table._cols[self._col_name]
+
+    @property
+    def _valid_rows(self):
+        return self._table._valid_rows
 
     def __getitem__(self, key: int | slice | list | np.ndarray):
-        # --- CASO 1: SCALAR (int) ---
         if isinstance(key, int):
-            # Normalizar índice negativo
             n_rows = len(self)
             if key < 0:
                 key += n_rows
             if not (0 <= key < n_rows):
                 raise IndexError(f"index {key} is out of bounds for column with size {n_rows}")
 
-            # Copiamos la idea de head()/tail(): iterar chunks buscando el N-ésimo True
             arr = self._valid_rows
             count = 0
             chunk_size = arr.chunks[0]
@@ -96,26 +99,21 @@ class Column:
                 actual_size = min(chunk_size, arr.shape[0] - info.nchunk * chunk_size)
                 chunk_start = info.nchunk * chunk_size
 
-                # Si es un chunk especial lleno de ceros (todo False), lo saltamos entero
                 if info.special == blosc2.SpecialValue.ZERO:
                     continue
 
-                # Si es un chunk especial con un valor repetido
                 if info.special == blosc2.SpecialValue.VALUE:
                     val = np.frombuffer(info.repeated_value, dtype=arr.dtype)[0]
-                    if not val:  # Todo False
+                    if not val:
                         continue
 
-                    # Todo True: comprobamos si nuestro índice 'key' cae dentro de este bloque
                     if count + actual_size <= key:
                         count += actual_size
                         continue
 
-                    # ¡El índice está aquí dentro!
                     pos_true = chunk_start + (key - count)
                     break
 
-                # Caso general: no es especial, tenemos que descomprimir SOLO este chunk de booleanos
                 chunk_data = arr[chunk_start: chunk_start + actual_size]
                 n_true = int(np.count_nonzero(chunk_data))
 
@@ -123,39 +121,34 @@ class Column:
                     count += n_true
                     continue
 
-                # El N-ésimo True está en este chunk de booleanos. Lo encontramos.
                 pos_true = chunk_start + int(np.flatnonzero(chunk_data)[key - count])
                 break
 
             if pos_true == -1:
                 raise IndexError("Unexpected error finding physical index.")
 
-            # Extraemos SOLO el elemento físico de la columna cruda
             return self._raw_col[int(pos_true)]
 
-        # --- CASO 2: SLICES y ARRAYS ---
-        # Para múltiples accesos, el where de blosc2 (que se procesa en C internamente) es óptimo
         elif isinstance(key, slice):
             real_pos = blosc2.where(self._valid_rows, np.arange(len(self._valid_rows))).compute()
             lindices = range(*key.indices(len(real_pos)))
-            phys_indices = [real_pos[i] for i in lindices]
+            phys_indices = np.array([real_pos[i] for i in lindices], dtype=np.int64)
             return self._raw_col[phys_indices]
 
         elif isinstance(key, (list, tuple, np.ndarray)):
             real_pos = blosc2.where(self._valid_rows, np.arange(len(self._valid_rows))).compute()
-            phys_indices = [real_pos[i] for i in key]
+            phys_indices = np.array([real_pos[i] for i in key], dtype=np.int64)
             return self._raw_col[phys_indices]
 
         raise TypeError(f"Invalid index type: {type(key)}")
 
     def __setitem__(self, key: int | slice | list | np.ndarray, value):
-        # Aplicamos exactamente la misma optimización para modificar un solo valor
         if isinstance(key, int):
             n_rows = len(self)
             if key < 0:
                 key += n_rows
             if not (0 <= key < n_rows):
-                raise IndexError("index out of bounds")
+                raise IndexError(f"index {key} is out of bounds for column with size {n_rows}")
 
             arr = self._valid_rows
             count = 0
@@ -190,26 +183,26 @@ class Column:
 
             self._raw_col[int(pos_true)] = value
 
-        # Para múltiples modificaciones
         elif isinstance(key, slice):
             real_pos = blosc2.where(self._valid_rows, np.arange(len(self._valid_rows))).compute()
             lindices = range(*key.indices(len(real_pos)))
-            phys_indices = [real_pos[i] for i in lindices]
+            phys_indices = np.array([real_pos[i] for i in lindices], dtype=np.int64)
+
+            if isinstance(value, (list, tuple)):
+                value = np.array(value, dtype=self._raw_col.dtype)
+
             self._raw_col[phys_indices] = value
 
         elif isinstance(key, (list, tuple, np.ndarray)):
             real_pos = blosc2.where(self._valid_rows, np.arange(len(self._valid_rows))).compute()
-            phys_indices = [real_pos[i] for i in key]
+            phys_indices = np.array([real_pos[i] for i in key], dtype=np.int64)
+
+            if isinstance(value, (list, tuple)):
+                value = np.array(value, dtype=self._raw_col.dtype)
+
             self._raw_col[phys_indices] = value
         else:
             raise TypeError(f"Invalid index type: {type(key)}")
-
-    def __len__(self):
-        return blosc2.count_nonzero(self._valid_rows)
-
-    @property
-    def dtype(self):
-        return self._raw_col.dtype
 
     def __iter__(self):
         arr = self._valid_rows
@@ -241,6 +234,13 @@ class Column:
             valid_data = self._raw_col[physical_indices.tolist()]
 
             yield from valid_data
+
+    def __len__(self):
+        return blosc2.count_nonzero(self._valid_rows)
+
+    @property
+    def dtype(self):
+        return self._raw_col.dtype
 
 
 class CTable(Generic[RowT]):
@@ -522,10 +522,14 @@ class CTable(Generic[RowT]):
         return retval
 
     def __getitem__(self, s: str):
-        return self._cols[s] if s in self._cols else None
+        if s in self._cols:
+            return Column(self, s)
+        return None
 
     def __getattr__(self, s: str):
-        return self._cols[s] if s in self._cols else super().__getattribute__(s)
+        if s in self._cols:
+            return Column(self, s)
+        return super().__getattribute__(s)
 
     def compact(self):
         real_poss = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
