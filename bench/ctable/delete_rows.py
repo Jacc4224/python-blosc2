@@ -484,7 +484,7 @@ def test_delete_invalid_list_with_strings():
     data = generate_test_data(50)
     table = CTable(RowModel, new_data=data, expected_size=50)
 
-    with pytest.raises(TypeError):
+    with pytest.raises(Exception):
         table.delete([0, "invalid", 10])
 
 

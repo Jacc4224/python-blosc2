@@ -62,7 +62,7 @@ if __name__ == "__main__":
 
     # Generación masiva actualizada
 
-    n_rows = 10_000_000
+    n_rows = 100_000
     data_masiva = []
     print(f"Creando {n_rows} filas.")
 
@@ -160,3 +160,4 @@ if __name__ == "__main__":
     print(len(h))
     print(blosc2.count_nonzero(h._valid_rows))
     print("------------------------------------------------------")
+
