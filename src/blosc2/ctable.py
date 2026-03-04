@@ -238,6 +238,30 @@ class Column:
     def __len__(self):
         return blosc2.count_nonzero(self._valid_rows)
 
+    def __lt__(self, other):
+        # < (Less than)
+        return self._raw_col < other
+
+    def __le__(self, other):
+        # <= (Less than or equal to)
+        return self._raw_col <= other
+
+    def __eq__(self, other):
+        # == (Equal to)
+        return self._raw_col == other
+
+    def __ne__(self, other):
+        # != (Not equal to)
+        return self._raw_col != other
+
+    def __gt__(self, other):
+        # > (Greater than)
+        return self._raw_col > other
+
+    def __ge__(self, other):
+        # >= (Greater than or equal to)
+        return self._raw_col >= other
+
     @property
     def dtype(self):
         return self._raw_col.dtype
@@ -544,10 +568,6 @@ class CTable(Generic[RowT]):
 
         self._valid_rows[:self._n_rows] = True
         self._valid_rows[self._n_rows:] = False
-        while blosc2.count_nonzero(self._valid_rows) < len(self._valid_rows)//2:
-            for k, v in self._cols.items():
-                v.resize((len(self._valid_rows)//2,))
-            self._valid_rows.resize((len(self._valid_rows)//2,))
 
     # Revisar
     def __setitem__(self, key, value):
