@@ -114,22 +114,16 @@ if __name__ == "__main__":
     print("------------------------------------------------------")
 
 
-    '''filtro = ((tabla['id'] <=1_000_000) & (tabla['score'] > 80)).compute()
+    filtro = ((tabla['id'] <=1_000_000) & (tabla['score'] > 80)).compute()
     start = time.perf_counter()
     tabla2 = tabla.where(filtro)
     stop = time.perf_counter()
     print(f"Tiempo filter: {stop - start:.4f} s")
-    print("------------------------------------------------------")'''
+    print("------------------------------------------------------")
 
 
 
-    # En el main
-    total_comprimido = sum(col.cbytes for col in tabla._cols.values()) + tabla._valid_rows.cbytes
-    total_sin_comprimir = sum(col.nbytes for col in tabla._cols.values()) + tabla._valid_rows.nbytes
-
-    print(f"Comprimido: {total_comprimido / 1024 ** 2:.2f} MB")
-    print(f"Sin comprimir: {total_sin_comprimir / 1024 ** 2:.2f} MB")
-    print(f"Ratio: {total_sin_comprimir/total_comprimido:.2}x")
+    tabla.info()
 
 
 
@@ -161,8 +155,3 @@ if __name__ == "__main__":
     print(blosc2.count_nonzero(h._valid_rows))
     print("------------------------------------------------------")
 
-
-    tabla2 = blosc2.CTable(RowModel)
-
-
-    tabla2.compact()

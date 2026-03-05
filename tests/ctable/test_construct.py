@@ -79,22 +79,31 @@ def assert_table_equals_data(table: CTable, expected_data: list):
     assert len(table) == len(expected_data), \
         f"Expected length {len(expected_data)}, got {len(table)}"
 
+    # Get column names to map indices to attribute access
+    col_names = table.col_names
+
     # Check row by row
     for i in range(len(expected_data)):
+        # row_extracted is now a CTable view of 1 row
         row_extracted = table.row[i]
         expected_row = expected_data[i]
 
         for col_idx, expected_val in enumerate(expected_row):
-            extracted_val = row_extracted[col_idx]
+            col_name = col_names[col_idx]
 
+            # Access the column dynamically and get the 0-th element of the view
+            # e.g., row_extracted.id[0]
+            extracted_val = getattr(row_extracted, col_name)[0]
+
+            # Compare floats and complex numbers with tolerance
             if isinstance(expected_val, (float, complex)):
                 np.testing.assert_allclose(
                     extracted_val, expected_val,
-                    err_msg=f"Discrepancy at row {i}, col {col_idx}"
+                    err_msg=f"Discrepancy at row {i}, col {col_name} (idx {col_idx})"
                 )
             else:
                 assert extracted_val == expected_val, \
-                    f"Row {i}, col {col_idx}: expected {expected_val}, got {extracted_val}"
+                    f"Row {i}, col {col_name}: expected {expected_val}, got {extracted_val}"
 
 
 # -------------------------------------------------------------------
@@ -229,8 +238,8 @@ def test_create_from_large_list():
     table = CTable(RowModel, new_data=LARGE_DATA)
     assert len(table) == 10_000
     # Verify only a few rows to avoid saturation
-    assert table.row[0][0] == 1  # first id
-    assert table.row[9999][0] == 10_000  # last id
+    assert table.id[0] == 1  # first id
+    assert table.id[9999] == 10_000  # last id
 
 
 def test_create_from_large_struct():
@@ -462,11 +471,11 @@ def test_column_access():
 
     # Access via __getitem__
     id_col = table["id"]
-    assert isinstance(id_col, blosc2.NDArray)
+    assert isinstance(id_col, blosc2.ctable.Column)
 
     # Access via __getattr__
     score_col = table.score
-    assert isinstance(score_col, blosc2.NDArray)
+    assert isinstance(score_col, blosc2.ctable.Column)
 
 
 def test_column_types():

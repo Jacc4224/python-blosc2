@@ -569,43 +569,6 @@ class CTable(Generic[RowT]):
         self._valid_rows[:self._n_rows] = True
         self._valid_rows[self._n_rows:] = False
 
-    # Revisar
-    def __setitem__(self, key, value):
-        if key not in self._cols.keys():
-            raise KeyError(f"Key {key} not in ColumnTable")
-
-        if key == self._key:
-            raise KeyError("Cannot modify column set as key")
-
-        if isinstance(value, blosc2.LazyExpr):
-            value = value.compute()
-        elif isinstance(value, np.ndarray):
-            value = blosc2.asarray(value)
-        elif not isinstance(value, blosc2.NDArray):
-            try:
-                value = blosc2.asarray(value)
-            except Exception as e:
-                raise TypeError(
-                    f"Could not turn value for '{key}' to a NDArray. "
-                    f"Accepted types: blosc2.NDArray, numpy.ndarray, blosc2.LazyExpr, lists. "
-                    f"Error: {e}"
-                )
-
-
-        if len(value) != self._n_rows:
-            raise ValueError(
-                f"Inconsistent length. Table has {self._nrows} rows, "
-                f"but column '{key}' has {value.shape[0]} rows."
-            )
-
-
-        if value.dtype != self._cols[key].dtype:
-            raise TypeError(
-                    f"Inconsistent dtype. The column '{key}' is of type {self._cols[key].dtype}., "
-                    f"but the new value is of type {value.dtype}."
-                )
-        # 3. Asignar al diccionario interno
-        self._cols[key] = value
 
     @property
     def nrows(self) -> int:
@@ -615,24 +578,56 @@ class CTable(Generic[RowT]):
     def ncols(self) -> int:
         return len(self._cols)
 
-    def info(self):
+    def info(self) -> None:
         """
-        nºColumns:
-        nºRows:
-        Key:
-
-        #   Column  Non-Null Count  Dtype
-       ---  ------  --------------  -----
-        0   id      50 non-null     int64
-        1   name    50 non-null     <U32
-        2   score   50 non-null     float32
-        3   a
-
-        memory usage:
-
-
+        Prints a concise summary of the CTable, including the column names,
+        their data types, and memory layout.
         """
-        ...
+        n_cols = len(self._cols)
+        n_rows = len(self)
+
+        # Calculate global memory usage
+        cbytes = sum(col.cbytes for col in self._cols.values()) + self._valid_rows.cbytes
+        nbytes = sum(col.nbytes for col in self._cols.values()) + self._valid_rows.nbytes
+
+        def format_bytes(bytes_size: float) -> str:
+            if bytes_size < 1024:
+                return f"{bytes_size} B"
+            elif bytes_size < 1024 ** 2:
+                return f"{bytes_size / 1024:.2f} KB"
+            elif bytes_size < 1024 ** 3:
+                return f"{bytes_size / (1024 ** 2):.2f} MB"
+            else:
+                return f"{bytes_size / (1024 ** 3):.2f} GB"
+
+        ratio = (nbytes / cbytes) if cbytes > 0 else 0.0
+
+        lines = []
+        lines.append(f"<class 'CTable'>")
+        lines.append(f"nºColumns: {n_cols}")
+        lines.append(f"nºRows: {n_rows}")
+        lines.append("")
+
+        # New Header: replaced "Non-Null Count" with internal Array length & Itemsize
+        header = f" {'#':>3}   {'Column':<15} {'Itemsize':<12} {'Dtype':<15}"
+        lines.append(header)
+        lines.append(f" {'---':>3}  {'------':<15} {'--------':<12} {'-----':<15}")
+
+        for i, name in enumerate(self.col_names):
+            col_array = self._cols[name]
+            dtype_str = str(col_array.dtype)
+            itemsize = f"{col_array.dtype.itemsize} B"
+
+            line = f" {i:>3}   {name:<15} {itemsize:<12} {dtype_str:<15}"
+            lines.append(line)
+
+        lines.append("")
+        lines.append(f"memory usage: {format_bytes(cbytes)}")
+        lines.append(f"uncompressed size: {format_bytes(nbytes)}")
+        lines.append(f"compression ratio: {ratio:.2f}x")
+        lines.append("")
+
+        print("\n".join(lines))
 
     def append(self, data: list | np.void | np.ndarray) -> None:
         if self.base != None:
