@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from typing import Annotated
 
 
-# --- Setup básico de modelos para los tests ---
+# --- Basic model setup for tests ---
 class NumpyDtype:
     def __init__(self, dtype):
         self.dtype = dtype
@@ -20,67 +20,63 @@ def generate_test_data(n_rows: int) -> list:
     return [(i, float(i)) for i in range(n_rows)]
 
 
-# -------------------------------------------------------------------
-# TESTS ESPECÍFICOS PARA COMPACT()
-# -------------------------------------------------------------------
-
 def test_compact_empty_table():
-    """Prueba compact() en una tabla completamente vacía (sin datos)."""
+    """Test compact() on a completely empty table (no data)."""
     table = CTable(RowModel, expected_size=100)
     initial_capacity = len(table._valid_rows)
 
     assert len(table) == 0
 
-    # No debería lanzar ningún error
+    # Should not raise any error
     table.compact()
 
-    # La capacidad puede haberse reducido drásticamente, pero la tabla lógica debe seguir vacía
+    # Capacity might have drastically reduced, but the logical table must remain empty
     assert len(table) == 0
-    # Verificamos que si se añaden datos después, funciona correctamente
+    # Verify that if data is added later, it works correctly
     table.append((1, 10.0))
     assert len(table) == 1
     assert table.id[0] == 1
 
 
 def test_compact_full_table():
-    """Prueba compact() en una tabla completamente llena (sin agujeros ni espacio libre)."""
+    """Test compact() on a completely full table (no holes or free space)."""
     data = generate_test_data(50)
     table = CTable(RowModel, new_data=data, expected_size=50)
 
     assert len(table) == 50
     initial_capacity = len(table._valid_rows)
 
-    # No debería lanzar ningún error ni cambiar el estado lógico
+    # Should not raise any error or change the logical state
     table.compact()
 
     assert len(table) == 50
-    # La capacidad no debería haber cambiado porque ya estaba llena
+    # Capacity should not have changed because it was already full
     assert len(table._valid_rows) == initial_capacity
 
-    # Verificamos integridad de datos
+    # Verify data integrity
     assert table.id[0] == 0
     assert table.id[-1] == 49
 
 
 def test_compact_already_compacted_table():
-    """Prueba compact() en una tabla que tiene espacio libre pero ningún agujero (datos contiguos)."""
+    """Test compact() on a table that has free space but no holes (contiguous data)."""
     data = generate_test_data(20)
-    # Expected_size grande para asegurar que hay espacio libre al final
+    # Large expected_size to ensure free space at the end
     table = CTable(RowModel, new_data=data, expected_size=100)
 
     assert len(table) == 20
 
-    # Ejecutamos compact. Como los datos ya están contiguos, la tabla podría reducir
-    # su tamaño por el while de < len//2, pero no debería fallar.
+    # Execute compact. Since data is already contiguous, the table might reduce
+    # its size due to the < len//2 while loop, but it shouldn't fail.
     table.compact()
 
     assert len(table) == 20
 
-    # Verificamos que los datos siguen en su sitio
+    # Verify that data remains in place
     for i in range(20):
         assert table.id[i] == i
 
-    # Validamos que todos los True están seguidos al principio
+    # Validate that all True values are consecutive at the beginning
     mask = table._valid_rows[:len(table._valid_rows)]
     assert np.all(mask[:20] == True)
     if len(mask) > 20:
@@ -88,30 +84,30 @@ def test_compact_already_compacted_table():
 
 
 def test_compact_with_holes():
-    """Prueba compact() en una tabla con alta fragmentación (agujeros)."""
+    """Test compact() on a table with high fragmentation (holes)."""
     data = generate_test_data(30)
     table = CTable(RowModel, new_data=data, expected_size=50)
 
-    # Borramos de forma dispersa: dejamos solo [0, 5, 10, 15, 20, 25]
+    # Delete sparsely: leave only [0, 5, 10, 15, 20, 25]
     to_delete = [i for i in range(30) if i % 5 != 0]
     table.delete(to_delete)
 
     assert len(table) == 6
 
-    # Ejecutamos compact
+    # Execute compact
     table.compact()
 
     assert len(table) == 6
 
-    # Verificamos que los datos correctos sobrevivieron y se movieron al principio
+    # Verify that the correct data survived and moved to the beginning
     expected_ids = [0, 5, 10, 15, 20, 25]
     for i, exp_id in enumerate(expected_ids):
-        # A través de la vista lógica (Column wrapper)
+        # Through the logical view (Column wrapper)
         assert table.id[i] == exp_id
-        # A través del array físico de blosc2 (para asegurar que compact funcionó)
+        # Through the physical blosc2 array (to ensure compact worked)
         assert table._cols["id"][i] == exp_id
 
-    # Verificamos la máscara física: los primeros 6 deben ser True, el resto False
+    # Verify physical mask: first 6 must be True, the rest False
     mask = table._valid_rows[:len(table._valid_rows)]
     assert np.all(mask[:6] == True)
     if len(mask) > 6:
@@ -119,33 +115,33 @@ def test_compact_with_holes():
 
 
 def test_compact_all_deleted():
-    """Prueba compact() en una tabla donde se han borrado absolutamente todas las filas."""
+    """Test compact() on a table where absolutely all rows have been deleted."""
     data = generate_test_data(20)
     table = CTable(RowModel, new_data=data, expected_size=20)
 
-    # Borramos todo
+    # Delete everything
     table.delete(list(range(20)))
     assert len(table) == 0
 
-    # Debería manejar arreglos vacíos correctamente
+    # Should handle empty arrays correctly
     table.compact()
 
     assert len(table) == 0
 
-    # Comprobamos que podemos volver a escribir en ella
+    # Check that we can write to it again
     table.append((99, 99.0))
     assert len(table) == 1
     assert table.id[0] == 99
 
 
 def test_compact_multiple_times():
-    """Llamar a compact() varias veces seguidas no debe corromper los datos ni crashear."""
+    """Calling compact() multiple times in a row must not corrupt data or crash."""
     data = generate_test_data(10)
     table = CTable(RowModel, new_data=data, expected_size=20)
 
-    table.delete([1, 3, 5, 7, 9])  # Quedan 5 elementos
+    table.delete([1, 3, 5, 7, 9])  # 5 elements remaining
 
-    # Compactar 3 veces seguidas
+    # Compact 3 times in a row
     table.compact()
     table.compact()
     table.compact()
