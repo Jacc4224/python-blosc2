@@ -629,56 +629,54 @@ class CTable(Generic[RowT]):
 
         print("\n".join(lines))
 
+
     def append(self, data: list | np.void | np.ndarray) -> None:
-        if self.base != None:
+        if self.base is not None:
             raise TypeError("Cannot extend view.")
 
         is_list = isinstance(data, (list, tuple))
-        col_values = list(self._cols.values())
-        col_names = self.col_names
 
-        if isinstance(data, dict):
-            raise TypeError("Dictionaries are not supported in append.")
+        arr = self._valid_rows
+        chunk_size = arr.chunks[0]
+        last_true_pos = -1
 
-        if is_list and len(data) != len(col_values):
-            raise ValueError(f"Expected {len(col_values)} values, received {len(data)}")
+        for info in reversed(list(arr.iterchunks_info())):
+            actual_size = min(chunk_size, arr.shape[0] - info.nchunk * chunk_size)
+            chunk_start = info.nchunk * chunk_size
 
-        if is_list:
-            for i, val in enumerate(data):
-                target_dtype = col_values[i].dtype
-                try:
-                    np.array(val, dtype=target_dtype)
-                except (ValueError, TypeError):
-                    raise TypeError(
-                        f"Value '{val}' is not compatible with column '{col_names[i]}' of type {target_dtype}")
-        else:
-            for name, arr in self._cols.items():
-                try:
-                    val = data[name]
-                except (IndexError, KeyError, ValueError):
-                    raise ValueError(f"Input data does not contain required field '{name}'")
+            if info.special == blosc2.SpecialValue.ZERO:
+                continue
 
-                try:
-                    np.array(val, dtype=arr.dtype)
-                except (ValueError, TypeError):
-                    raise TypeError(f"Value '{val}' in field '{name}' is not compatible with type {arr.dtype}")
+            if info.special == blosc2.SpecialValue.VALUE:
+                val = np.frombuffer(info.repeated_value, dtype=arr.dtype)[0]
+                if not val:
+                    continue
+                last_true_pos = chunk_start + actual_size - 1
+                break
 
-        ultimas_validas = blosc2.where(self._valid_rows, np.array(range(len(self._valid_rows)))).compute()
-        pos = ultimas_validas[-1] + 1 if len(ultimas_validas) > 0 else 0
+            chunk_data = arr[chunk_start: chunk_start + actual_size]
+            nonzero = np.flatnonzero(chunk_data)
+            if len(nonzero) == 0:
+                continue
+            last_true_pos = chunk_start + int(nonzero[-1])
+            break
+
+        pos = last_true_pos + 1
+
         if pos >= len(self._valid_rows):
             c = len(self._valid_rows)
-            for k,v in self._cols.items():
+            for v in self._cols.values():
                 v.resize((c * 2,))
             self._valid_rows.resize((c * 2,))
 
         if is_list:
-            for i, col_array in enumerate(col_values):
+            for i, col_array in enumerate(self._cols.values()):
                 col_array[pos] = data[i]
         else:
             for name, col_array in self._cols.items():
                 col_array[pos] = data[name]
-        self._valid_rows[pos] = True
 
+        self._valid_rows[pos] = True
         self._n_rows += 1
 
     def delete(self, ind: int | slice | str | Iterable) -> blosc2.NDArray:
