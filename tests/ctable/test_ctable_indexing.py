@@ -10,6 +10,7 @@
 import dataclasses
 import shutil
 import tempfile
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -93,8 +94,27 @@ def test_where_with_index_matches_scan_in_memory():
     # Drop index to force scan
     t.drop_index("id")
     result_scan = t.where(t["id"] > 100)
-    ids_idx = sorted(int(v) for v in result_idx["id"].to_numpy())
-    ids_scan = sorted(int(v) for v in result_scan["id"].to_numpy())
+    ids_idx = sorted(int(v) for v in result_idx["id"][:])
+    ids_scan = sorted(int(v) for v in result_scan["id"][:])
+    assert ids_idx == ids_scan
+
+
+def test_create_expression_index_in_memory():
+    t = _make_table(50)
+    idx = t.create_index(expression="value * category", kind=blosc2.IndexKind.FULL, name="vc")
+    assert idx.kind == "full"
+    assert t.index(expression="value * category").name == "vc"
+    assert t.index(name="vc").name == "vc"
+
+
+def test_where_with_expression_index_matches_scan_in_memory():
+    t = _make_table(200)
+    t.create_index(expression="value * category", kind=blosc2.IndexKind.FULL, name="vc")
+    result_idx = t.where((t._cols["value"] * t._cols["category"]) >= 150)
+    t.drop_index(expression="value * category")
+    result_scan = t.where((t._cols["value"] * t._cols["category"]) >= 150)
+    ids_idx = sorted(int(v) for v in result_idx["id"][:])
+    ids_scan = sorted(int(v) for v in result_scan["id"][:])
     assert ids_idx == ids_scan
 
 
@@ -110,10 +130,10 @@ def test_bool_column_composes_naturally_in_where():
         t.append([i, "north" if i % 4 == 0 else "south", i % 2 == 0])
 
     result = t.where((t["sensor_id"] >= 8) & t["active"] & (t["region"] == "north"))
-    assert sorted(int(v) for v in result["sensor_id"].to_numpy()) == [8, 12, 16]
+    assert sorted(int(v) for v in result["sensor_id"][:]) == [8, 12, 16]
 
     result_bare = t.where(t["active"])
-    assert sorted(int(v) for v in result_bare["sensor_id"].to_numpy()) == list(range(0, 20, 2))
+    assert sorted(int(v) for v in result_bare["sensor_id"][:]) == list(range(0, 20, 2))
 
 
 def test_rebuild_index_in_memory():
@@ -172,7 +192,7 @@ def test_stale_fallback_to_scan_in_memory():
     t.append([200, 200.0, 0])  # marks stale
     # Query should still work (falls back to scan)
     result = t.where(t["id"] > 40)
-    ids = sorted(int(v) for v in result["id"].to_numpy())
+    ids = sorted(int(v) for v in result["id"][:])
     assert 200 in ids
     assert 41 in ids
 
@@ -193,9 +213,32 @@ def test_multi_column_conjunction_uses_multiple_indexes_in_memory():
     t.drop_index("id")
     t.drop_index("category")
     result_scan = t.where(expr)
-    ids_idx = sorted(int(v) for v in result_idx["id"].to_numpy())
-    ids_scan = sorted(int(v) for v in result_scan["id"].to_numpy())
+    ids_idx = sorted(int(v) for v in result_idx["id"][:])
+    ids_scan = sorted(int(v) for v in result_scan["id"][:])
     assert ids_idx == ids_scan
+
+
+def test_full_index_large_ctable_column_matches_scan_in_memory():
+    @dataclasses.dataclass
+    class SensorRow:
+        sensor_id: int = blosc2.field(blosc2.int32())
+
+    n = 300_000
+    rng = np.random.default_rng(42)
+    data = np.empty(n, dtype=np.dtype([("sensor_id", np.int32)]))
+    data["sensor_id"] = rng.integers(0, n // 10, size=n, dtype=np.int32)
+
+    t = blosc2.CTable(SensorRow, expected_size=n)
+    t.extend(data)
+    t.create_index("sensor_id", kind=blosc2.IndexKind.FULL)
+
+    result_idx = t.where(t["sensor_id"] > 29_000)
+    t.drop_index("sensor_id")
+    result_scan = t.where(t["sensor_id"] > 29_000)
+
+    ids_idx = np.sort(np.asarray(result_idx["sensor_id"][:]))
+    ids_scan = np.sort(np.asarray(result_scan["sensor_id"][:]))
+    assert np.array_equal(ids_idx, ids_scan)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +266,33 @@ def test_create_index_persistent(tmpdir):
     assert sidecars, "No sidecar .b2nd files found"
 
 
+def test_create_index_persistent_does_not_cache_sidecar_handles(tmpdir):
+    import blosc2.indexing as indexing
+
+    path = str(tmpdir / "table.b2d")
+    t = _make_table(50, persistent_path=path)
+    t.create_index("id", kind=blosc2.IndexKind.FULL)
+
+    cached = [
+        key
+        for key in indexing._SIDECAR_HANDLE_CACHE
+        if key[0][0] == "persistent" and str(tmpdir) in key[0][1]
+    ]
+    assert cached == []
+
+
+def test_persistent_ctable_releases_immediately_without_gc(tmpdir):
+    path = str(tmpdir / "table.b2d")
+
+    def build_table():
+        t = _make_table(50, persistent_path=path)
+        t.create_index("id", kind=blosc2.IndexKind.FULL)
+        return weakref.ref(t)
+
+    table_ref = build_table()
+    assert table_ref() is None
+
+
 def test_catalog_survives_reopen(tmpdir):
     path = str(tmpdir / "table.b2d")
     t = _make_table(30, persistent_path=path)
@@ -245,9 +315,34 @@ def test_where_with_index_matches_scan_persistent(tmpdir):
     t.drop_index("id")
     result_scan = t.where(t["id"] > 150)
 
-    ids_idx = sorted(int(v) for v in result_idx["id"].to_numpy())
-    ids_scan = sorted(int(v) for v in result_scan["id"].to_numpy())
+    ids_idx = sorted(int(v) for v in result_idx["id"][:])
+    ids_scan = sorted(int(v) for v in result_scan["id"][:])
     assert ids_idx == ids_scan
+
+
+def test_persistent_index_drop_releases_sidecars_without_gc(tmpdir):
+    import gc
+
+    def run_query_and_drop():
+        path = str(tmpdir / "table.b2d")
+        t = _make_table(200, persistent_path=path)
+        t.create_index("id")
+        result = t.where(t["id"] > 150)
+        ids = sorted(int(v) for v in result["id"][:])
+        assert ids == list(range(151, 200))
+        t.drop_index("id")
+
+    run_query_and_drop()
+
+    sidecars = [
+        obj
+        for obj in gc.get_objects()
+        if isinstance(obj, blosc2.NDArray)
+        and obj.urlpath
+        and str(tmpdir) in obj.urlpath
+        and "__index__" in obj.urlpath
+    ]
+    assert sidecars == []
 
 
 def test_drop_index_persistent(tmpdir):
@@ -260,6 +355,35 @@ def test_drop_index_persistent(tmpdir):
     # After drop, index dir should be gone (or empty)
     sidecars = list(index_dir.glob("**/*.b2nd")) if index_dir.exists() else []
     assert sidecars == []
+
+
+def test_expression_index_persistent_roundtrip(tmpdir):
+    path = str(tmpdir / "table.b2d")
+    t = _make_table(50, persistent_path=path)
+    t.create_index(expression="value * category", kind=blosc2.IndexKind.FULL, name="vc")
+
+    reopened = blosc2.CTable.open(path, mode="r")
+    idx = reopened.index(expression="value * category")
+    assert idx.kind == "full"
+    result = reopened.where((reopened._cols["value"] * reopened._cols["category"]) >= 60)
+    assert len(result) > 0
+
+
+def test_sort_by_computed_column_with_expression_full_index():
+    t = _make_table(40)
+    t.add_computed_column("score", "value * category")
+    t.create_index(expression="value * category", kind=blosc2.IndexKind.FULL, name="score_expr")
+
+    sorted_t = t.sort_by("score")
+    expected = np.sort(np.asarray(t._computed_cols["score"]["lazy"][:])[t._valid_rows[:]])
+    np.testing.assert_allclose(sorted_t["score"][:], expected)
+
+
+def test_sort_by_stored_column_with_full_index():
+    t = _make_table(40)
+    t.create_index("id", kind=blosc2.IndexKind.FULL)
+    sorted_t = t.sort_by("id", ascending=False)
+    np.testing.assert_array_equal(sorted_t["id"][:], np.arange(39, -1, -1, dtype=np.int32))
 
 
 def test_drop_index_persistent_catalog_cleared(tmpdir):
@@ -301,7 +425,7 @@ def test_compact_index_persistent(tmpdir):
     t.compact_index("id")
     # Query should still work after compact
     result = t.where(t["id"] > 40)
-    ids = sorted(int(v) for v in result["id"].to_numpy())
+    ids = sorted(int(v) for v in result["id"][:])
     expected = list(range(41, 50))
     assert ids == expected
 
@@ -345,7 +469,7 @@ def test_query_after_reopen_persistent(tmpdir):
 
     t2 = blosc2.open(path, mode="r")
     result = t2.where(t2["id"] > 90)
-    ids = sorted(int(v) for v in result["id"].to_numpy())
+    ids = sorted(int(v) for v in result["id"][:])
     assert ids == list(range(91, 100))
 
 
@@ -358,7 +482,7 @@ def test_rename_indexed_column_rebuilds_catalog_persistent(tmpdir):
     assert not (Path(path) / "_indexes" / "id").exists()
     assert (Path(path) / "_indexes" / "newid").exists()
     result = t.where(t["newid"] > 35)
-    assert sorted(int(v) for v in result["newid"].to_numpy()) == [36, 37, 38, 39]
+    assert sorted(int(v) for v in result["newid"][:]) == [36, 37, 38, 39]
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +526,7 @@ def test_view_query_uses_root_index():
     t.create_index("id")
     # Query on the original table
     result_direct = t.where(t["id"] > 180)
-    ids_direct = sorted(int(v) for v in result_direct["id"].to_numpy())
+    ids_direct = sorted(int(v) for v in result_direct["id"][:])
     assert ids_direct == list(range(181, 200))
 
 
@@ -465,3 +589,58 @@ def test_indexed_ctable_b2z_double_open_append_no_corruption(tmp_path):
     assert t2.nrows == 50
     assert len(t2.indexes) == 1
     del t2
+
+
+def test_indexing_purges_stale_persistent_caches():
+    import blosc2.indexing as indexing
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = str(Path(tmpdir) / "table.b2d")
+        t = _make_table(50, persistent_path=path)
+        t.create_index("id")
+        _ = t.where(t["id"] > 10)
+        t.close()
+
+        persistent_scope = ("persistent", str(Path(path).resolve()))
+        indexing._PERSISTENT_INDEXES[persistent_scope] = {"version": 1, "indexes": {}}
+        indexing._DATA_CACHE[(persistent_scope, "token", "partial", "offsets")] = np.arange(
+            3, dtype=np.int64
+        )
+        indexing._SIDECAR_HANDLE_CACHE[(persistent_scope, "token", "partial_handle", "offsets")] = object()
+        indexing._QUERY_CACHE_STORE_HANDLES[str(Path(tmpdir) / "query-cache.b2frame")] = object()
+        indexing._GATHER_MMAP_HANDLES[str(Path(tmpdir) / "gather-cache.b2nd")] = object()
+
+    indexing._purge_stale_persistent_caches()
+
+    assert all(tmpdir not in key[1] for key in indexing._PERSISTENT_INDEXES if key[0] == "persistent")
+    assert all(tmpdir not in key[0][1] for key in indexing._DATA_CACHE if key[0][0] == "persistent")
+    assert all(
+        tmpdir not in key[0][1] for key in indexing._SIDECAR_HANDLE_CACHE if key[0][0] == "persistent"
+    )
+    assert all(tmpdir not in path for path in indexing._QUERY_CACHE_STORE_HANDLES)
+    assert all(tmpdir not in path for path in indexing._GATHER_MMAP_HANDLES)
+
+
+def test_indexing_purge_tolerates_reentrant_sidecar_handle_cache_mutation(monkeypatch):
+    import blosc2.indexing as indexing
+
+    stale_scope = ("persistent", "/tmp/stale-index.b2nd")
+    stale_key = (stale_scope, "token", "partial_handle", "offsets")
+    injected_key = (("memory", 12345), "token", "partial_handle", "offsets")
+    sentinel = object()
+    original_exists = indexing._persistent_cache_path_exists
+
+    indexing._SIDECAR_HANDLE_CACHE[stale_key] = sentinel
+
+    def mutating_exists(path):
+        indexing._SIDECAR_HANDLE_CACHE[injected_key] = sentinel
+        if path == stale_scope[1]:
+            return False
+        return original_exists(path)
+
+    monkeypatch.setattr(indexing, "_persistent_cache_path_exists", mutating_exists)
+
+    indexing._purge_stale_persistent_caches()
+
+    assert stale_key not in indexing._SIDECAR_HANDLE_CACHE
+    indexing._SIDECAR_HANDLE_CACHE.pop(injected_key, None)

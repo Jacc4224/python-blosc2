@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import inspect
 import math
+import weakref
 from abc import abstractmethod
 from collections import OrderedDict, namedtuple
 from collections.abc import Mapping
@@ -146,23 +147,33 @@ class Array(Protocol):
 class FieldsAccessor(Mapping):
     """Read-only mapping of structured field views."""
 
-    def __init__(self, field_views: dict[str, Any]):
-        self._field_views = field_views
+    def __init__(self, ndarr, field_names: Sequence[str]):
+        self._ndarr_ref = weakref.ref(ndarr)
+        self._field_names = tuple(field_names)
+
+    def _ndarr(self):
+        ndarr = self._ndarr_ref()
+        if ndarr is None:
+            raise ReferenceError("owning NDArray has been released")
+        return ndarr
 
     def __getitem__(self, key: str) -> Any:
-        return self._field_views[key]
+        if key not in self._field_names:
+            raise KeyError(key)
+        return NDField(self._ndarr(), key)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._field_views)
+        return iter(self._field_names)
 
     def __len__(self) -> int:
-        return len(self._field_views)
+        return len(self._field_names)
 
     def __setitem__(self, key: str, value: object) -> None:
         raise TypeError(f'assign through the field view, e.g. array.fields["{key}"][:] = values')
 
     def copy(self) -> dict[str, Any]:
-        return dict(self._field_views)
+        ndarr = self._ndarr()
+        return {field: NDField(ndarr, field) for field in self._field_names}
 
     def __or__(self, other: object) -> dict[str, Any]:
         if not isinstance(other, Mapping):
@@ -175,7 +186,7 @@ class FieldsAccessor(Mapping):
         return dict(other) | self.copy()
 
     def __repr__(self) -> str:
-        return repr(self._field_views)
+        return repr(dict(self))
 
 
 def is_documented_by(original):
@@ -548,7 +559,7 @@ def sum(
         If set to True, the reduced axes are left in the result
         as dimensions with size one. With this option, the result will broadcast
         correctly against the input array.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
     kwargs: dict, optional
@@ -593,7 +604,7 @@ def cumulative_sum(
     Calculates the cumulative sum of elements in the input array ndarr.
 
     Parameters
-    -----------
+    ----------
     ndarr: :ref:`NDArray` or :ref:`NDField` or :ref:`C2Array` or :ref:`LazyExpr`
         The input array or expression.
     axis: int
@@ -602,7 +613,7 @@ def cumulative_sum(
         Data type of the returned array.
     include_initial : bool
         Boolean indicating whether to include the initial value as the first value in the output. Initial value will be zero. Default: False.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
     kwargs: dict, optional
@@ -629,7 +640,7 @@ def cumulative_prod(
     Calculates the cumulative product of elements in the input array ndarr.
 
     Parameters
-    -----------
+    ----------
     ndarr: :ref:`NDArray` or :ref:`NDField` or :ref:`C2Array` or :ref:`LazyExpr`
         The input array or expression.
     axis: int
@@ -638,7 +649,7 @@ def cumulative_prod(
         Data type of the returned array.
     include_initial : bool
         Boolean indicating whether to include the initial value as the first value in the output. Initial value will be one. Default: False.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
     kwargs: dict, optional
@@ -718,7 +729,7 @@ def std(
         If set to True, the reduced axes are left in the result as
         dimensions with size one. This ensures that the result will broadcast correctly
         against the input array.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
     kwargs: dict, optional
@@ -853,7 +864,7 @@ def min(
         If set to True, the axes which are reduced are left in the result as
         dimensions with size one. With this option, the result will broadcast correctly
         against the input array.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
     kwargs: dict, optional
@@ -987,7 +998,7 @@ def argmin(
 
     keepdims: bool
         If True, reduced axis included in the result as singleton dimension. Otherwise, axis not included in the result. Default: False.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
 
@@ -1017,7 +1028,7 @@ def argmax(
 
     keepdims: bool
         If True, reduced axis included in the result as singleton dimension. Otherwise, axis not included in the result. Default: False.
-    fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+    fp_accuracy: :class:`blosc2.FPAccuracy`, optional
         Specifies the floating-point accuracy for reductions on :ref:`LazyExpr`.
         Passed to :func:`LazyExpr.compute` when :paramref:`ndarr` is a LazyExpr.
 
@@ -3219,12 +3230,12 @@ class Operand:
     @abstractmethod
     def dtype(self) -> np.dtype:
         """
-        Get the data type of the :ref:`Operand`.
+        Get the data type of the :class:`Operand`.
 
         Returns
         -------
         out: np.dtype
-            The data type of the :ref:`Operand`.
+            The data type of the :class:`Operand`.
         """
         pass
 
@@ -3232,12 +3243,12 @@ class Operand:
     @abstractmethod
     def shape(self) -> tuple[int]:
         """
-        Get the shape of the :ref:`Operand`.
+        Get the shape of the :class:`Operand`.
 
         Returns
         -------
         out: tuple
-                The shape of the :ref:`Operand`.
+                The shape of the :class:`Operand`.
         """
         pass
 
@@ -3245,12 +3256,12 @@ class Operand:
     @abstractmethod
     def ndim(self) -> int:
         """
-        Get the number of dimensions of the :ref:`Operand`.
+        Get the number of dimensions of the :class:`Operand`.
 
         Returns
         -------
         out: int
-            The number of dimensions of the :ref:`Operand`.
+            The number of dimensions of the :class:`Operand`.
         """
         pass
 
@@ -3258,12 +3269,12 @@ class Operand:
     @abstractmethod
     def info(self) -> InfoReporter:
         """
-        Get information about the :ref:`Operand`.
+        Get information about the :class:`Operand`.
 
         Returns
         -------
         out: InfoReporter
-            A printable class with information about the :ref:`Operand`.
+            A printable class with information about the :class:`Operand`.
         """
         pass
 
@@ -3743,11 +3754,8 @@ class NDArray(blosc2_ext.NDArray, Operand):
         base = kwargs.pop("_base", None)
         super().__init__(kwargs["_array"], base=base)
         # Accessor to fields
-        field_views = {}
-        if self.dtype.fields:
-            for field in self.dtype.fields:
-                field_views[field] = NDField(self, field)
-        self._fields = FieldsAccessor(field_views)
+        field_names = tuple(self.dtype.fields) if self.dtype.fields else ()
+        self._fields = FieldsAccessor(self, field_names)
 
     @property
     def cparams(self) -> blosc2.CParams:
@@ -6652,7 +6660,7 @@ def argsort(array: blosc2.Array, order: str | list[str] | None = None, **kwargs:
 
     Parameters
     ----------
-    array: :ref:`blosc2.Array`
+    array: :class:`blosc2.Array`
         The 1-D array to be ordered.
     order: str, list of str, optional
         Primary and optional secondary order keys for structured arrays. When
@@ -6702,7 +6710,7 @@ def sort(array: blosc2.Array, order: str | list[str] | None = None, **kwargs: An
 
     Parameters
     ----------
-    array: :ref:`blosc2.Array`
+    array: :class:`blosc2.Array`
         The (structured) array to be sorted.
     order: str, list of str, optional
         Specifies which fields to compare first, second, etc. A single
@@ -6765,7 +6773,7 @@ def iter_sorted(
 
     Parameters
     ----------
-    array : :ref:`blosc2.Array`
+    array : :class:`blosc2.Array`
         The array to iterate.
     order : str, list of str, optional
         Specifies which fields define the ordered traversal. The first field
@@ -6968,7 +6976,7 @@ def empty_like(x: blosc2.Array, dtype=None, **kwargs) -> NDArray:
         These arguments will be set in the resulting :ref:`NDArray`.
 
     Returns
-    ------
+    -------
     out : NDArray
         An array having the same shape as x and containing uninitialized data.
     """
@@ -6995,7 +7003,7 @@ def ones_like(x: blosc2.Array, dtype=None, **kwargs) -> NDArray:
         These arguments will be set in the resulting :ref:`NDArray`.
 
     Returns
-    ------
+    -------
     out : NDArray
         An array having the same shape as x and containing ones.
     """
@@ -7022,7 +7030,7 @@ def zeros_like(x: blosc2.Array, dtype=None, **kwargs) -> NDArray:
         These arguments will be set in the resulting :ref:`NDArray`.
 
     Returns
-    ------
+    -------
     out : NDArray
         An array having the same shape as x and containing zeros.
     """
@@ -7052,7 +7060,7 @@ def full_like(x: blosc2.Array, fill_value: bool | int | float | complex, dtype=N
         These arguments will be set in the resulting :ref:`NDArray`.
 
     Returns
-    ------
+    -------
     out : NDArray
         An array having the same shape as x and containing the fill value.
     """

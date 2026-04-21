@@ -106,6 +106,52 @@ def _cleanup_in_memory_store(key: int) -> None:
     _hot_cache_clear(scope=("memory", key))
 
 
+def _persistent_cache_path_exists(path: str | int) -> bool:
+    if not isinstance(path, str):
+        return False
+    path_obj = Path(path)
+    return path_obj.exists() or path_obj.parent.exists()
+
+
+def _purge_stale_persistent_caches() -> None:
+    stale_scopes = {
+        key
+        for key in tuple(_PERSISTENT_INDEXES)
+        if key[0] == "persistent" and not _persistent_cache_path_exists(key[1])
+    }
+    for key in stale_scopes:
+        _PERSISTENT_INDEXES.pop(key, None)
+
+    stale_data_keys = {
+        key
+        for key in tuple(_DATA_CACHE)
+        if key[0][0] == "persistent" and not _persistent_cache_path_exists(key[0][1])
+    }
+    stale_scopes.update(key[0] for key in stale_data_keys)
+    for key in stale_data_keys:
+        _DATA_CACHE.pop(key, None)
+
+    stale_handle_keys = {
+        key
+        for key in tuple(_SIDECAR_HANDLE_CACHE)
+        if key[0][0] == "persistent" and not _persistent_cache_path_exists(key[0][1])
+    }
+    stale_scopes.update(key[0] for key in stale_handle_keys)
+    for key in stale_handle_keys:
+        _SIDECAR_HANDLE_CACHE.pop(key, None)
+
+    stale_query_paths = [path for path in tuple(_QUERY_CACHE_STORE_HANDLES) if not Path(path).exists()]
+    for path in stale_query_paths:
+        _QUERY_CACHE_STORE_HANDLES.pop(path, None)
+
+    stale_gather_paths = [path for path in tuple(_GATHER_MMAP_HANDLES) if not Path(path).exists()]
+    for path in stale_gather_paths:
+        _GATHER_MMAP_HANDLES.pop(path, None)
+
+    for scope in stale_scopes:
+        _hot_cache_clear(scope=scope)
+
+
 @dataclass(slots=True)
 class IndexPlan:
     usable: bool
@@ -286,6 +332,7 @@ def _resolve_full_index_tmpdir(array: blosc2.NDArray, tmpdir: str | None) -> str
 
 
 def _load_store(array: blosc2.NDArray) -> dict:
+    _purge_stale_persistent_caches()
     if _is_persistent_array(array):
         key = _array_key(array)
         cached = _PERSISTENT_INDEXES.get(key)
@@ -405,6 +452,7 @@ def _open_query_cache_store(array: blosc2.NDArray, *, create: bool = False):
     Returns ``None`` if the array is not persistent.  When *create* is True the
     store is created if it does not yet exist.
     """
+    _purge_stale_persistent_caches()
     if not _is_persistent_array(array):
         return None
     path = _query_cache_payload_path(array)
@@ -920,6 +968,7 @@ def _invalidate_sidecar_cache_entries(array: blosc2.NDArray, token: str, categor
 
 
 def _open_sidecar_handle(array: blosc2.NDArray, token: str, category: str, name: str, path: str | None):
+    _purge_stale_persistent_caches()
     cache_key = _sidecar_handle_cache_key(array, token, category, name)
     cached = _SIDECAR_HANDLE_CACHE.get(cache_key)
     if cached is not None:
@@ -1108,8 +1157,11 @@ def _store_array_sidecar(
             kwargs["blocks"] = blocks
         if cparams is not None:
             kwargs["cparams"] = cparams
+        # Do not retain writable persistent handles in the process-wide cache.
+        # They keep native resources alive after index construction and can
+        # accumulate badly across tests on macOS/Python 3.14.
         handle = blosc2.asarray(data, **kwargs)
-        _SIDECAR_HANDLE_CACHE[handle_cache_key] = handle
+        del handle
         _DATA_CACHE.pop(cache_key, None)
     else:
         path = None
@@ -1152,10 +1204,9 @@ def _create_persistent_sidecar_handle(
         kwargs["cparams"] = cparams
     if length == 0:
         handle = blosc2.asarray(np.empty(0, dtype=dtype), **kwargs)
-        _SIDECAR_HANDLE_CACHE[_sidecar_handle_cache_key(array, token, category, name)] = handle
+        del handle
         return None, {"path": path, "dtype": dtype.descr if dtype.fields else dtype.str}
     handle = blosc2.empty((length,), dtype=dtype, **kwargs)
-    _SIDECAR_HANDLE_CACHE[_sidecar_handle_cache_key(array, token, category, name)] = handle
     return handle, {"path": path, "dtype": dtype.descr if dtype.fields else dtype.str}
 
 
@@ -2672,9 +2723,13 @@ def _read_ndarray_linear_span(array: blosc2.NDArray | np.ndarray, start: int, ou
         chunk_id = cursor // chunk_len
         local_start = cursor % chunk_len
         take = min(len(out) - out_cursor, chunk_len - local_start)
-        array.get_1d_span_numpy(
-            out[out_cursor : out_cursor + take], int(chunk_id), int(local_start), int(take)
-        )
+        target = out[out_cursor : out_cursor + take]
+        try:
+            array.get_1d_span_numpy(target, int(chunk_id), int(local_start), int(take))
+        except RuntimeError:
+            # Newer c-blosc2 builds can reject getitem on some tiny persistent
+            # sidecars even though normal ndarray slicing still succeeds.
+            target[...] = array[cursor : cursor + take]
         cursor += take
         out_cursor += take
 
@@ -4600,7 +4655,7 @@ def _exact_positions_from_sorted_chunks(
         if lo >= hi:
             continue
         matched = np.empty(hi - lo, dtype=np.int64)
-        positions_sidecar.get_1d_span_numpy(matched, int(chunk_id), lo, hi - lo)
+        _read_ndarray_linear_span(positions_sidecar, chunk_start + lo, matched)
         parts.append(matched)
 
     if not parts:
@@ -4653,7 +4708,7 @@ def _exact_positions_from_compact_full_base(
             if lo >= hi:
                 continue
             matched = np.empty(hi - lo, dtype=np.int64)
-            positions_sidecar.get_1d_span_numpy(matched, int(chunk_id), local_start + lo, hi - lo)
+            _read_ndarray_linear_span(positions_sidecar, span_start + lo, matched)
             parts.append(matched)
 
     if not parts:
@@ -4874,6 +4929,7 @@ def _gather_mmap_source(where_x):
     urlpath = getattr(where_x, "urlpath", None)
     if not _supports_block_reads(where_x) or urlpath is None:
         return where_x
+    _purge_stale_persistent_caches()
     urlpath = str(urlpath)
     handle = _GATHER_MMAP_HANDLES.get(urlpath)
     if handle is None:

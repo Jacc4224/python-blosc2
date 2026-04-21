@@ -449,14 +449,15 @@ class LazyArray(ABC, blosc2.Operand):
             the evaluated result. This difference between slicing operands and slicing the final expression
             is important when reductions or a where clause are used in the expression.
 
-        fp_accuracy: :ref:`blosc2.FPAccuracy`, optional
+        fp_accuracy: :class:`blosc2.FPAccuracy`, optional
             Specifies the floating-point accuracy to be used during computation.
-            By default, :ref:`blosc2.FPAccuracy.DEFAULT` is used.
+            By default, :attr:`blosc2.FPAccuracy.DEFAULT` is used.
 
         kwargs: Any, optional
             Keyword arguments that are supported by the :func:`empty` constructor.
             These arguments will be set in the resulting :ref:`NDArray`.
             Additionally, the following special kwargs are supported:
+
             - ``strict_miniexpr`` (bool): controls whether miniexpr compilation/execution
               failures are raised instead of silently falling back to regular chunked eval
               for non-DSL expressions.
@@ -552,7 +553,7 @@ class LazyArray(ABC, blosc2.Operand):
 
         Notes
         -----
-        * All the operands of the LazyArray must be Python scalars, or :ref:`blosc2.Array` objects.
+        * All the operands of the LazyArray must be Python scalars, or :class:`blosc2.Array` objects.
         * If an operand is a :ref:`Proxy`, keep in mind that Python-Blosc2 will only be able to reopen it as such
           if its source is a :ref:`SChunk`, :ref:`NDArray` or a :ref:`C2Array` (see :func:`blosc2.open` notes
           section for more info).
@@ -1181,7 +1182,8 @@ def get_chunk(arr, info, nchunk):
 async def async_read_chunks(arrs, info, queue):
     loop = asyncio.get_event_loop()
     shape, chunks_ = arrs[0].shape, arrs[0].chunks
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    max_workers = max(1, min(len(arrs), int(getattr(blosc2, "nthreads", 1) or 1)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         my_chunk_iter = range(arrs[0].schunk.nchunks)
         if len(info) == 5:
             if info[-1] is not None:
@@ -1212,20 +1214,38 @@ def async_read_chunks_thread(arrs, info, queue):
 def sync_read_chunks(arrs, info):
     queue_size = 2  # maximum number of chunks in the queue
     queue = Queue(maxsize=queue_size)
+    worker_exc = None
+
+    def _run_async_reader():
+        nonlocal worker_exc
+        try:
+            async_read_chunks_thread(arrs, info, queue)
+        except BaseException as exc:
+            worker_exc = exc
+            queue.put(None)
 
     # Start the async file reading in a separate thread
-    thread = threading.Thread(target=async_read_chunks_thread, args=(arrs, info, queue))
+    thread = threading.Thread(target=_run_async_reader)
     thread.start()
 
-    # Read the chunks synchronously from the queue
-    while True:
-        try:
-            chunks = queue.get(timeout=1)  # Wait for the next chunk
-            if chunks is None:  # End of chunks
-                break
-            yield chunks
-        except Empty:
-            continue
+    try:
+        # Read the chunks synchronously from the queue
+        while True:
+            try:
+                chunks = queue.get(timeout=1)  # Wait for the next chunk
+                if chunks is None:  # End of chunks
+                    if worker_exc is not None:
+                        raise worker_exc
+                    break
+                yield chunks
+            except Empty:
+                if not thread.is_alive():
+                    if worker_exc is not None:
+                        raise worker_exc from None
+                    break
+                continue
+    finally:
+        thread.join()
 
 
 def read_nchunk(arrs, info):
@@ -2761,7 +2781,7 @@ def _eval_zero_input_dsl_if_needed(
     return True, full_res
 
 
-def chunked_eval(  # noqa: C901
+def chunked_eval(
     expression: str | Callable[[tuple, np.ndarray, tuple[int]], None], operands: dict, item=(), **kwargs
 ):
     """
@@ -3143,7 +3163,7 @@ class LazyExpr(LazyArray):
                 self.operands = {"o0": value1, "o1": value2}
                 self.expression = f"(o0 {op} o1)"
 
-    def update_expr(self, new_op):  # noqa: C901
+    def update_expr(self, new_op):
         prev_flag = blosc2._disable_overloaded_equal
         # We use a lot of the original NDArray.__eq__ as 'is', so deactivate the overloaded one
         blosc2._disable_overloaded_equal = True
@@ -4418,10 +4438,13 @@ def lazyudf(
     func: Python function
         The user-defined function to apply to each block. This function will
         always receive the following parameters:
+
         - `inputs_tuple`: A tuple containing the corresponding slice for the block of each input
-        in :paramref:`inputs`.
+          in :paramref:`inputs`.
         - `output`: The buffer to be filled as a multidimensional numpy.ndarray.
-        - `offset`: The multidimensional offset corresponding to the start of the block being computed:
+        - `offset`: The multidimensional offset corresponding to the start of the block
+          being computed. Example signature::
+
             def myudf(inputs_tuple, output, offset):
                 x, y = inputs_tuple
                 ...
@@ -4449,7 +4472,9 @@ def lazyudf(
         :meth:`LazyArray.compute` methods. The
         last one will ignore the `urlpath` parameter passed in this function.
         In addition, one may provide ``in_place``, a bool (default False), which indicates whether
-        the function should modify the output directly, (rather than chunks of the output, which are later written to output):
+        the function should modify the output directly (rather than chunks of the output, which
+        are later written to output). Example::
+
             def inplace_udf(inputs_tuple, output, offset):
                 x, y = inputs_tuple
                 ...
