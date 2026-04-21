@@ -1069,6 +1069,9 @@ class CTable(Generic[RowT]):
         self._storage = storage
         self._read_only = storage.is_read_only()
 
+        if storage.table_exists() and mode == "w":
+            shutil.rmtree(urlpath)
+
         if storage.table_exists() and mode != "w":
             # ---- Open existing persistent table ----
             if new_data is not None:
@@ -1555,8 +1558,12 @@ class CTable(Generic[RowT]):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _make_view(cls, parent: CTable, new_valid_rows: blosc2.NDArray) -> CTable:
-        """Construct a read-only view sharing *parent*'s columns."""
+    def _make_view(cls, parent: CTable, new_valid_rows: blosc2.NDArray, n_rows: int | None = None) -> CTable:
+        """Construct a read-only view sharing *parent*'s columns.
+
+        Pass *n_rows* when the caller already knows the live-row count to skip
+        the expensive ``count_nonzero`` scan over the entire mask.
+        """
         obj = cls.__new__(cls)
         obj._row_type = parent._row_type
         obj._validate = parent._validate
@@ -1572,7 +1579,7 @@ class CTable(Generic[RowT]):
         obj.auto_compact = parent.auto_compact
         obj.base = parent
         obj._valid_rows = new_valid_rows
-        obj._n_rows = int(blosc2.count_nonzero(new_valid_rows))
+        obj._n_rows = n_rows if n_rows is not None else int(blosc2.count_nonzero(new_valid_rows))
         obj._last_pos = None
         return obj
 
@@ -3491,9 +3498,10 @@ class CTable(Generic[RowT]):
                 total = len(self._valid_rows)
                 mask = np.zeros(total, dtype=bool)
                 valid_pos = positions[(positions >= 0) & (positions < total)]
-                mask[valid_pos] = True
-                mask &= self._valid_rows[:]
-                return self.view(blosc2.asarray(mask))
+                mask[valid_pos] = self._valid_rows[valid_pos]
+                n_live = int(mask.sum())
+                _fast_cparams = blosc2.CParams(codec=blosc2.Codec.LZ4, clevel=1)
+                return CTable._make_view(self, blosc2.asarray(mask, cparams=_fast_cparams), n_rows=n_live)
 
         filter = expr_result.compute() if isinstance(expr_result, blosc2.LazyExpr) else expr_result
 
